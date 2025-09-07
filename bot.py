@@ -9,12 +9,47 @@ load_dotenv(override=True)
 TOKEN=(os.getenv("DISCORD_TOKEN") or "").strip()
 OWNER_ID=os.getenv("OWNER_ID")
 HUB_ID=int(os.getenv("EMOJI_HUB_ID") or 0)
+
+# >>> NOWE: lista gildii do szybkiej synchronizacji (per-guild)
+def _parse_guild_ids(s:str)->List[int]:
+    parts=re.split(r"[,\s;]+", (s or "").strip())
+    ids=[]
+    for p in parts:
+        p=p.strip()
+        if not p: continue
+        try:
+            ids.append(int(p))
+        except:
+            logging.warning(f"Pominięto niepoprawne GUILD_ID: {p!r}")
+    return ids
+GUILD_IDS:List[int]=_parse_guild_ids(os.getenv("GUILD_IDS",""))
+
 if not TOKEN or len(TOKEN)<50: raise RuntimeError("Brak/niepoprawny DISCORD_TOKEN")
 
 intents=discord.Intents.default()
+
 class MyClient(discord.Client):
-    def __init__(self): super().__init__(intents=intents); self.tree=app_commands.CommandTree(self)
-    async def setup_hook(self): await self.tree.sync()
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree=app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        # Jeśli podano GUILD_IDS -> kopiujemy globalne komendy do wybranych gildii
+        # i synchronizujemy per-guild (aktualizacja w kilka sekund).
+        if GUILD_IDS:
+            for gid in GUILD_IDS:
+                try:
+                    gobj=discord.Object(id=gid)
+                    # przenieś wszystkie zdefiniowane komendy jako „guild commands”
+                    self.tree.copy_global_to(guild=gobj)
+                    synced = await self.tree.sync(guild=gobj)
+                    logging.info(f"Zsynchronizowano {len(synced)} komend dla gildii {gid}")
+                except Exception as e:
+                    logging.warning(f"Nie udało się zsynchronizować komend dla gildii {gid}: {e}")
+        else:
+            # Bez GUILD_IDS zostaje globalna synchronizacja (może trwać do ~1h).
+            await self.tree.sync()
+
 client=MyClient(); tree=client.tree
 
 def fmt_int(x): return f"{int(round(float(x))):,}".replace(","," ")
