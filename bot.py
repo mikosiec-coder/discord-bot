@@ -1,4 +1,3 @@
-# bot.py
 from __future__ import annotations
 import os, re, math, logging, sys
 from typing import Dict, List, Tuple, Optional
@@ -6,7 +5,6 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-# ====== KONFIG / ENV ======
 load_dotenv(override=True)
 
 def _clean_token(raw: str) -> str:
@@ -16,7 +14,6 @@ def _clean_token(raw: str) -> str:
     return t
 
 TOKEN = _clean_token(os.getenv("DISCORD_TOKEN") or "")
-OWNER_ID = os.getenv("OWNER_ID")
 HUB_ID = int(os.getenv("EMOJI_HUB_ID") or 0)
 
 def _parse_ids(s: str) -> List[int]:
@@ -32,18 +29,16 @@ def _parse_ids(s: str) -> List[int]:
     return out
 
 GUILD_IDS: List[int] = _parse_ids(os.getenv("GUILD_IDS", ""))
-RUN_MODE = (os.getenv("RUN_MODE") or "bot").strip().lower()  # bot | purge_global | purge_guild | purge_all
+RUN_MODE = (os.getenv("RUN_MODE") or "bot").strip().lower()
 
 if not TOKEN:
     raise RuntimeError("Brak DISCORD_TOKEN (sprawdź .env).")
 
-# ====== LOGOWANIE ======
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discord")
 logger.setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
-# ====== TRYBY CZYSZCZENIA (uruchamiane i kończone bez startu bota) ======
 intents_min = discord.Intents.none()
 intents_min.guilds = True
 
@@ -58,7 +53,6 @@ async def _purge_global():
             left = await self.tree.fetch_commands()
             log.info(f"[PURGE_GLOBAL] Globalne po czyszczeniu: {[c.name for c in left]}")
             await self.close()
-
     Cleaner().run(TOKEN)
 
 async def _purge_guilds(guild_ids: List[int]):
@@ -78,21 +72,14 @@ async def _purge_guilds(guild_ids: List[int]):
                 left = await self.tree.fetch_commands(guild=g)
                 log.info(f"[PURGE_GUILD] {gid}: {[c.name for c in left]}")
             await self.close()
-
     Cleaner(guild_ids).run(TOKEN)
 
 if RUN_MODE in {"purge_global", "purge_guild", "purge_all"}:
-    # uruchom synchronicznie (discord.py i tak blokuje)
     if RUN_MODE in {"purge_global", "purge_all"}:
-        # global
-        class _Runner:
-            pass
-        # mała sztuczka: wywołaj, potem lecimy dalej
         try:
             import asyncio
             asyncio.run(_purge_global())
         except RuntimeError:
-            # event loop already running (rzadko w zwykłym uruchomieniu) – awaryjnie
             discord.Client(intents=intents_min).close()
     if RUN_MODE in {"purge_guild", "purge_all"}:
         try:
@@ -102,41 +89,31 @@ if RUN_MODE in {"purge_global", "purge_guild", "purge_all"}:
             discord.Client(intents=intents_min).close()
     sys.exit(0)
 
-# ====== BOT (per-guild only, bez duplikatów) ======
 intents = discord.Intents.default()
 
 class MyClient(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-
     async def setup_hook(self):
-        # 1) CZYSZCZENIE GLOBALI (na wszelki wypadek) – żeby nie było duplikatów
         try:
             self.tree.clear_commands(guild=None)
             await self.tree.sync()
             log.info("Globalne komendy wyczyszczone.")
         except Exception as e:
             log.warning(f"Nie udało się wyczyścić globalnych: {e}")
-
-        # 2) Rejestracja komend
         if not GUILD_IDS:
-            # fallback: globalnie (gdy nie podano GUILD_IDS)
             for cmd in ALL_CMDS:
-                try:
-                    self.tree.add_command(cmd)
-                except Exception as e:
-                    log.warning(f"add_command (global) {cmd.name}: {e}")
+                try: self.tree.add_command(cmd)
+                except Exception as e: log.warning(f"add_command (global) {cmd.name}: {e}")
             await self.tree.sync()
             log.info("Zsynchronizowano globalnie (brak GUILD_IDS).")
         else:
             for gid in GUILD_IDS:
                 gobj = discord.Object(id=gid)
                 for cmd in ALL_CMDS:
-                    try:
-                        self.tree.add_command(cmd, guild=gobj)
-                    except Exception as e:
-                        log.warning(f"add_command (guild={gid}) {cmd.name}: {e}")
+                    try: self.tree.add_command(cmd, guild=gobj)
+                    except Exception as e: log.warning(f"add_command (guild={gid}) {cmd.name}: {e}")
                 synced = await self.tree.sync(guild=gobj)
                 log.info(f"Zsynchronizowano {len(synced)} komend dla gildii {gid}")
                 try:
@@ -148,13 +125,21 @@ class MyClient(discord.Client):
 client = MyClient()
 tree = client.tree
 
-# ====== UTYLITKI ======
 def fmt_int(x): return f"{int(round(float(x))):,}".replace(","," ")
 def _to_int(s):
     try:
         return int(re.sub(r"[^\d-]", "", str(s)) or "0")
     except:
         return 0
+def _pl_dni(n:int)->str:
+    return "1 dzień" if int(n)==1 else f"{int(n)} dni"
+def _sev_emoji(days:int)->str:
+    if days <= 1:
+        return "🔴"
+    elif days <= 9:
+        return "🟠"
+    else:
+        return "🟢"
 
 HUB_EMOJI_ID: Dict[str,int] = {}
 HUB_NAMES = {
@@ -212,7 +197,6 @@ def E(key:str)->str:
             s=_app(nn)
             if s: return s
     return UNI.get(key, "•")
-
 def M(key:str)->str:
     alias=MEDAL_ALIAS.get(key)
     if alias:
@@ -272,7 +256,52 @@ def best_ruby_cost_for_charters(req:int)->Tuple[int,str,float]:
     avg= total/req if req>0 else 0.0
     return int(round(total)), plan, avg
 
-# ====== SESJE: Dekoracja ======
+def parse_yn_optional(val: str) -> Optional[bool]:
+    s = str(val or "").strip().lower()
+    if s == "": return None
+    if s in ("y","yes","tak","1"): return True
+    if s in ("n","no","nie","0"): return False
+    return None
+
+def days_until_below(current: int, threshold: int, daily_loss_pct: float) -> int:
+    c = float(max(0, int(current)))
+    t = float(max(0, int(threshold)))
+    r = max(0.0, min(100.0, float(daily_loss_pct))) / 100.0
+    if c < t:  return 0
+    if c == t: return 1
+    if r <= 0.0: return 10**9
+    n = math.log(t/c) / math.log(1.0 - r)
+    return max(0, math.ceil(n))
+
+def _beri_rate_and_boundary(cur: float) -> Tuple[float, int]:
+    if cur < 45_000:
+        return 3.0, 0
+    elif cur < 95_000:
+        return 4.0, 45_000
+    elif cur < 145_000:
+        return 5.0, 95_000
+    else:
+        return 7.0, 145_000
+
+def days_until_below_berimond(current: int, threshold: int) -> int:
+    c = float(max(0, int(current)))
+    t = float(max(0, int(threshold)))
+    if c < t: return 0
+    if c == t: return 1
+    days = 0
+    while c > t:
+        rate, boundary = _beri_rate_and_boundary(c)
+        r = rate / 100.0
+        target_in_seg = max(t, float(boundary))
+        if c <= target_in_seg:
+            break
+        n = days_until_below(int(c), int(target_in_seg), rate)
+        if n <= 0: n = 1
+        days += n
+        c = c * ((1.0 - r) ** n)
+        if days > 10000: break
+    return days
+
 SESS:Dict[int,dict]={}
 def _new_s(): return {"charter":0,"construction":0,"sceat":0,"upgrade":0,"samurai_medals":0,"samurai_tokens":0,"khan_medals":0,"khan_tablets":0,"current_level":0,"current_progress":0,"target_level":0}
 def _s(uid:int)->dict:
@@ -308,7 +337,7 @@ def _embed(guild, s, show=False):
         rub,plan,avg=best_ruby_cost_for_charters(s["charter"])
         emb.add_field(name=f"{E('rubies')} Koszt rubinów",value=f"Rubiny: **{fmt_int(rub)}**\nPlan:\n{plan}" if plan else f"Rubiny: **{fmt_int(rub)}**",inline=False)
         emb.set_footer(text=f"Średni koszt 1 pkt: {avg:.2f} rub.")
-    if show and s.get("target_level",0):
+    if show and s["target_level"]:
         target=int(s["target_level"])
         if lv>=10: need=0
         else:
@@ -384,7 +413,19 @@ class DekorView(discord.ui.View):
     @discord.ui.button(label="Wyczyść",style=discord.ButtonStyle.danger,emoji="🧹")
     async def b5(self,i,_): SESS[self.uid]=_new_s(); await i.response.edit_message(embed=_embed(i.guild,_s(self.uid),False),view=self)
 
-# ====== KOMENDY ======
+@app_commands.command(name="pomoc",description="Lista komend")
+async def pomoc(i:discord.Interaction):
+    d=(
+        "**/patronat** — panel dekoracji\n"
+        "**/liga** — Tytuły z medali\n"
+        "**/tytul** — kiedy tracisz bonus z chwały / Berimond\n"
+        "**/zbieracz** — ile musisz zdobyć punktów, by spełnić swój cel"
+    )
+    await i.response.send_message(
+        embed=discord.Embed(title="📚 Pomoc",description=d,color=0x3498DB),
+        ephemeral=True
+    )
+
 @app_commands.command(name="patronat",description="Panel liczenia dekoracji")
 async def patronat_cmd(i:discord.Interaction):
     await i.response.send_message(embed=_embed(i.guild,_s(i.user.id),False),view=DekorView(i.user.id),ephemeral=True)
@@ -432,8 +473,7 @@ def _liga_embed(g,s):
         one=weak_one(need)
         if one: post+=f"🗓️ Dziś wystarczy: {M(one)} ({PTS[one]})"
         else:
-            k1,k2=weak_two(need)
-            post+=f"🗓️ W 2 dni: {M(k1)} + {M(k2)} ({PTS[k1]}+{PTS[k2]})"
+            k1,k2=weak_two(need); post+=f"🗓️ W 2 dni: {M(k1)} + {M(k2)} ({PTS[k1]}+{PTS[k2]})"
         emb.add_field(name="🏆 Tytuł",value=f"{TITLE_EMOJI} **{cur}** → następny: **{nxt}**",inline=True)
         emb.add_field(name="📈 Postęp",value=post,inline=False)
     else:
@@ -482,11 +522,10 @@ class LigaView(discord.ui.View):
     @discord.ui.button(label="Wyczyść",style=discord.ButtonStyle.danger,emoji="🧹")
     async def d(self,i,_): LIGA[self.uid]=_new_l(); await i.response.edit_message(embed=_liga_embed(i.guild,_l(self.uid)),view=self)
 
-@app_commands.command(name="liga",description="Policz tytuł z medali")
+@app_commands.command(name="liga",description="Tytuły z medali")
 async def liga_cmd(i:discord.Interaction):
     await i.response.send_message(embed=_liga_embed(i.guild,_l(i.user.id)),view=LigaView(i.user.id),ephemeral=True)
 
-# ====== ZBIERACZ ======
 def required_today(current:int,days_left:int,target:int,mult:float=1.35)->int:
     days_left=max(0,int(days_left)); current=max(0,int(current)); target=max(0,int(target))
     need_base= target/(mult**days_left); return max(0, math.ceil(need_base-current))
@@ -509,28 +548,70 @@ class ZbieraczModal(discord.ui.Modal, title="Zbieracz — kalkulator"):
         except:
             await i.response.send_message("Błąd podczas obliczeń.",ephemeral=True)
 
-@app_commands.command(name="zbieracz",description="Kalkulator eventu Zbieracz")
+@app_commands.command(name="zbieracz",description="ile musisz zdobyć punktów, by spełnić swój cel")
 async def zbieracz_cmd(i:discord.Interaction):
     await i.response.send_modal(ZbieraczModal())
 
-@app_commands.command(name="pomoc",description="Lista komend")
-async def pomoc(i:discord.Interaction):
-    d="**/patronat** — panel dekoracji\n**/liga** — tytuł z medali\n**/zbieracz** — ile musisz dziś zdobyć"
-    await i.response.send_message(embed=discord.Embed(title="📚 Pomoc",description=d,color=0x3498DB),ephemeral=True)
+@app_commands.command(name="tytul", description="kiedy tracisz bonus z chwały / Berimond")
+async def tytul_cmd(i: discord.Interaction):
+    class TytulModal(discord.ui.Modal, title="Tytuły — dane"):
+        def __init__(self): super().__init__(custom_id="tytul:m")
+        glory = discord.ui.TextInput(label="Aktualna chwała (opcjonalnie)",required=False,placeholder="np. 30500000")
+        sub = discord.ui.TextInput(label="Subskrypcja? (Y/N, opcjonalnie)",required=False,placeholder="Y / N")
+        beri = discord.ui.TextInput(label="Punkty Berimond (opcjonalnie)",required=False,placeholder="np. 240000")
+        async def on_submit(self, inter: discord.Interaction):
+            try:
+                speed_threshold = 22_724_097
+                out_lines: List[str] = []
+                out_lines.append("🎖️ Tytuły")
+                glory_raw = (self.glory.value or "").strip()
+                sub_raw = (self.sub.value or "").strip()
+                beri_raw = (self.beri.value or "").strip()
+                if glory_raw:
+                    chwala = _to_int(glory_raw)
+                    sub_opt = parse_yn_optional(sub_raw)
+                    if sub_opt is None:
+                        daily_loss = 10.0
+                    else:
+                        daily_loss = 8.0 if sub_opt else 10.0
+                    dni = days_until_below(chwala, speed_threshold, daily_loss)
+                    out_lines.append("➡️Chwała:")
+                    out_lines.append(f"Aktualnie: {fmt_int(chwala)}")
+                    if chwala < speed_threshold:
+                        out_lines.append(f"{_sev_emoji(0)}Utrata bonusu: JUŻ.")
+                    elif chwala == speed_threshold:
+                        out_lines.append(f"{_sev_emoji(1)}Utrata bonusu za 1 dzień.")
+                    else:
+                        out_lines.append(f"{_sev_emoji(dni)}Utrata bonusu za { _pl_dni(dni) }.")
+                if beri_raw:
+                    ber = _to_int(beri_raw)
+                    T1, T2, T3 = 195_000, 95_000, 37_500
+                    d1 = days_until_below_berimond(ber, T1)
+                    d2 = days_until_below_berimond(ber, T2)
+                    d3 = days_until_below_berimond(ber, T3)
+                    out_lines.append("➡️Berimond:")
+                    out_lines.append(f"Aktualnie: {fmt_int(ber)}")
+                    def line(cur, thr, days, text):
+                        if cur < thr:
+                            return f"{_sev_emoji(0)} {text} (< {fmt_int(thr)}): JUŻ."
+                        elif cur == thr:
+                            return f"{_sev_emoji(1)} {text} (< {fmt_int(thr)}): za 1 dzień."
+                        else:
+                            return f"{_sev_emoji(days)} {text} (< {fmt_int(thr)}): za { _pl_dni(days) }."
+                    out_lines.append(line(ber, T1, d1, "-20% żywności na Zieleni"))
+                    out_lines.append(line(ber, T2, d2, "-20% żywności na Zieleni (kolejne -20%)"))
+                    out_lines.append(line(ber, T3, d3, "-20% produkcji na Krainach (dodatkowo)"))
+                if len(out_lines)==1:
+                    await inter.response.send_message("Podaj chociaż chwałę lub punkty Berimond.",ephemeral=True)
+                    return
+                e = discord.Embed(description="\n".join(out_lines), color=0xE67E22)
+                await inter.response.send_message(embed=e, ephemeral=True)
+            except Exception:
+                await inter.response.send_message("Błąd obliczeń.", ephemeral=True)
+    await i.response.send_modal(TytulModal())
 
-if OWNER_ID:
-    @app_commands.command(name="shutdown",description="Owner: wyłącz bota")
-    async def shutdown(i:discord.Interaction):
-        if i.user.id!=int(OWNER_ID):
-            return await i.response.send_message("Brak uprawnień.",ephemeral=True)
-        await i.response.send_message("Wyłączam się…",ephemeral=True)
-        await client.close()
+ALL_CMDS=[pomoc, patronat_cmd, liga_cmd, tytul_cmd, zbieracz_cmd]
 
-# lista komend do rejestracji
-ALL_CMDS=[patronat_cmd, liga_cmd, zbieracz_cmd, pomoc]
-if OWNER_ID: ALL_CMDS.append(shutdown)
-
-# ====== LIFECYCLE ======
 @client.event
 async def on_ready():
     await client.change_presence(activity=None, status=discord.Status.online)
@@ -542,5 +623,4 @@ async def on_ready():
         cmds = await client.tree.fetch_commands(guild=discord.Object(id=gid))
         log.info(f"GUILD {gid} → {[c.name for c in cmds]}")
 
-# START
 client.run(TOKEN)
