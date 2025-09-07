@@ -1,64 +1,163 @@
+# bot.py
 from __future__ import annotations
-import os, re, math, logging
-from typing import Dict, Optional, List, Tuple
+import os, re, math, logging, sys
+from typing import Dict, List, Tuple, Optional
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+# ====== KONFIG / ENV ======
 load_dotenv(override=True)
-TOKEN=(os.getenv("DISCORD_TOKEN") or "").strip()
-OWNER_ID=os.getenv("OWNER_ID")
-HUB_ID=int(os.getenv("EMOJI_HUB_ID") or 0)
 
-# >>> NOWE: lista gildii do szybkiej synchronizacji (per-guild)
-def _parse_guild_ids(s:str)->List[int]:
-    parts=re.split(r"[,\s;]+", (s or "").strip())
-    ids=[]
+def _clean_token(raw: str) -> str:
+    t = (raw or "").strip().strip('"').strip("'")
+    if t.lower().startswith("bot "):
+        t = t[4:].strip()
+    return t
+
+TOKEN = _clean_token(os.getenv("DISCORD_TOKEN") or "")
+OWNER_ID = os.getenv("OWNER_ID")
+HUB_ID = int(os.getenv("EMOJI_HUB_ID") or 0)
+
+def _parse_ids(s: str) -> List[int]:
+    parts = re.split(r"[,\s;]+", (s or "").strip())
+    out: List[int] = []
     for p in parts:
-        p=p.strip()
-        if not p: continue
+        if not p:
+            continue
         try:
-            ids.append(int(p))
+            out.append(int(p))
         except:
-            logging.warning(f"Pominięto niepoprawne GUILD_ID: {p!r}")
-    return ids
-GUILD_IDS:List[int]=_parse_guild_ids(os.getenv("GUILD_IDS",""))
+            logging.warning(f"Pominięto niepoprawne ID: {p!r}")
+    return out
 
-if not TOKEN or len(TOKEN)<50: raise RuntimeError("Brak/niepoprawny DISCORD_TOKEN")
+GUILD_IDS: List[int] = _parse_ids(os.getenv("GUILD_IDS", ""))
+RUN_MODE = (os.getenv("RUN_MODE") or "bot").strip().lower()  # bot | purge_global | purge_guild | purge_all
 
-intents=discord.Intents.default()
+if not TOKEN:
+    raise RuntimeError("Brak DISCORD_TOKEN (sprawdź .env).")
+
+# ====== LOGOWANIE ======
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("discord")
+logger.setLevel(logging.INFO)
+log = logging.getLogger(__name__)
+
+# ====== TRYBY CZYSZCZENIA (uruchamiane i kończone bez startu bota) ======
+intents_min = discord.Intents.none()
+intents_min.guilds = True
+
+async def _purge_global():
+    class Cleaner(discord.Client):
+        def __init__(self):
+            super().__init__(intents=intents_min)
+            self.tree = app_commands.CommandTree(self)
+        async def setup_hook(self):
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            left = await self.tree.fetch_commands()
+            log.info(f"[PURGE_GLOBAL] Globalne po czyszczeniu: {[c.name for c in left]}")
+            await self.close()
+
+    Cleaner().run(TOKEN)
+
+async def _purge_guilds(guild_ids: List[int]):
+    if not guild_ids:
+        log.error("Brak GUILD_IDS do purge_guild.")
+        return
+    class Cleaner(discord.Client):
+        def __init__(self, gids: List[int]):
+            super().__init__(intents=intents_min)
+            self.tree = app_commands.CommandTree(self)
+            self.gids = gids
+        async def setup_hook(self):
+            for gid in self.gids:
+                g = discord.Object(id=gid)
+                self.tree.clear_commands(guild=g)
+                await self.tree.sync(guild=g)
+                left = await self.tree.fetch_commands(guild=g)
+                log.info(f"[PURGE_GUILD] {gid}: {[c.name for c in left]}")
+            await self.close()
+
+    Cleaner(guild_ids).run(TOKEN)
+
+if RUN_MODE in {"purge_global", "purge_guild", "purge_all"}:
+    # uruchom synchronicznie (discord.py i tak blokuje)
+    if RUN_MODE in {"purge_global", "purge_all"}:
+        # global
+        class _Runner:
+            pass
+        # mała sztuczka: wywołaj, potem lecimy dalej
+        try:
+            import asyncio
+            asyncio.run(_purge_global())
+        except RuntimeError:
+            # event loop already running (rzadko w zwykłym uruchomieniu) – awaryjnie
+            discord.Client(intents=intents_min).close()
+    if RUN_MODE in {"purge_guild", "purge_all"}:
+        try:
+            import asyncio
+            asyncio.run(_purge_guilds(GUILD_IDS))
+        except RuntimeError:
+            discord.Client(intents=intents_min).close()
+    sys.exit(0)
+
+# ====== BOT (per-guild only, bez duplikatów) ======
+intents = discord.Intents.default()
 
 class MyClient(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
-        self.tree=app_commands.CommandTree(self)
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # Jeśli podano GUILD_IDS -> kopiujemy globalne komendy do wybranych gildii
-        # i synchronizujemy per-guild (aktualizacja w kilka sekund).
-        if GUILD_IDS:
-            for gid in GUILD_IDS:
-                try:
-                    gobj=discord.Object(id=gid)
-                    # przenieś wszystkie zdefiniowane komendy jako „guild commands”
-                    self.tree.copy_global_to(guild=gobj)
-                    synced = await self.tree.sync(guild=gobj)
-                    logging.info(f"Zsynchronizowano {len(synced)} komend dla gildii {gid}")
-                except Exception as e:
-                    logging.warning(f"Nie udało się zsynchronizować komend dla gildii {gid}: {e}")
-        else:
-            # Bez GUILD_IDS zostaje globalna synchronizacja (może trwać do ~1h).
+        # 1) CZYSZCZENIE GLOBALI (na wszelki wypadek) – żeby nie było duplikatów
+        try:
+            self.tree.clear_commands(guild=None)
             await self.tree.sync()
+            log.info("Globalne komendy wyczyszczone.")
+        except Exception as e:
+            log.warning(f"Nie udało się wyczyścić globalnych: {e}")
 
-client=MyClient(); tree=client.tree
+        # 2) Rejestracja komend
+        if not GUILD_IDS:
+            # fallback: globalnie (gdy nie podano GUILD_IDS)
+            for cmd in ALL_CMDS:
+                try:
+                    self.tree.add_command(cmd)
+                except Exception as e:
+                    log.warning(f"add_command (global) {cmd.name}: {e}")
+            await self.tree.sync()
+            log.info("Zsynchronizowano globalnie (brak GUILD_IDS).")
+        else:
+            for gid in GUILD_IDS:
+                gobj = discord.Object(id=gid)
+                for cmd in ALL_CMDS:
+                    try:
+                        self.tree.add_command(cmd, guild=gobj)
+                    except Exception as e:
+                        log.warning(f"add_command (guild={gid}) {cmd.name}: {e}")
+                synced = await self.tree.sync(guild=gobj)
+                log.info(f"Zsynchronizowano {len(synced)} komend dla gildii {gid}")
+                try:
+                    existing = await self.tree.fetch_commands(guild=gobj)
+                    log.info(f"GUILD {gid} → {[c.name for c in existing]}")
+                except Exception as e:
+                    log.warning(f"fetch_commands({gid}) nieudane: {e}")
 
+client = MyClient()
+tree = client.tree
+
+# ====== UTYLITKI ======
 def fmt_int(x): return f"{int(round(float(x))):,}".replace(","," ")
 def _to_int(s):
-    try: return int(re.sub(r"[^\d-]","",str(s)) or "0")
-    except: return 0
+    try:
+        return int(re.sub(r"[^\d-]", "", str(s)) or "0")
+    except:
+        return 0
 
-HUB_EMOJI_ID:Dict[str,int]={}
-HUB_NAMES={
+HUB_EMOJI_ID: Dict[str,int] = {}
+HUB_NAMES = {
  "patronat":["Patronat","patronat"],
  "zetony_budowy":["zetony_budowy"],
  "groszaki":["groszaki"],
@@ -86,11 +185,13 @@ async def load_hub_emoji():
     try:
         g = client.get_guild(HUB_ID) or await client.fetch_guild(HUB_ID)
         emojis = await g.fetch_emojis()
-        for e in emojis: HUB_EMOJI_ID[e.name]=e.id
-    except Exception as e: logging.warning(f"Nie udało się wczytać emoji z HUB_ID={HUB_ID}: {e}")
+        for e in emojis:
+            HUB_EMOJI_ID[e.name] = e.id
+    except Exception as e:
+        log.warning(f"Nie udało się wczytać emoji z HUB_ID={HUB_ID}: {e}")
 
-def _app(name:str)->str|None:
-    eid=HUB_EMOJI_ID.get(name)
+def _app(name: str) -> Optional[str]:
+    eid = HUB_EMOJI_ID.get(name)
     return f"<:{name}:{eid}>" if eid else None
 
 RES_KEYS={
@@ -106,11 +207,12 @@ RES_KEYS={
  "rubies":["rubiny"],
 }
 def E(key:str)->str:
-    for nm in RES_KEYS.get(key,[]):
-        for nn in HUB_NAMES.get(nm,[nm]):
+    for nm in RES_KEYS.get(key, []):
+        for nn in HUB_NAMES.get(nm, [nm]):
             s=_app(nn)
             if s: return s
-    return UNI.get(key,"•")
+    return UNI.get(key, "•")
+
 def M(key:str)->str:
     alias=MEDAL_ALIAS.get(key)
     if alias:
@@ -125,13 +227,16 @@ MELEE=[1,2,3,4,5,6,7,10,13,15]; RANGED=[1,2,3,4,5,6,7,10,13,15]; COURTY=[0,0,0,0
 PL_NAME={"charter":"Żetony patronatu","construction":"Żetony budowy","sceat":"Groszaki","upgrade":"Żetony ulepszenia","samurai_medals":"Medale Samuraja","samurai_tokens":"Żetony Samuraja","khan_medals":"Medale Chana","khan_tablets":"Tabliczki Nomada"}
 
 def calc_points(**spent): return sum((float(v)/COST_PER_POINT[k]) for k,v in spent.items() if v)
+
 def walk_levels(lv,prog,gain):
     lv=max(0,min(10,int(lv))); prog=float(max(0,prog)); pool=float(max(0,gain))
     if lv>=10: return 10,0.0,None,prog+pool
     while lv<10:
         need=LEVEL_COSTS[lv]-prog
-        if pool>=need: pool-=need; lv+=1; prog=0.0
-        else: prog+=pool; pool=0.0; break
+        if pool>=need:
+            pool-=need; lv+=1; prog=0.0
+        else:
+            prog+=pool; pool=0.0; break
         if lv==10: return 10,0.0,None,pool
     nxt=LEVEL_COSTS[lv]-prog if lv<10 else None
     return lv,prog,nxt,None
@@ -146,22 +251,28 @@ def best_ruby_cost_for_charters(req:int)->Tuple[int,str,float]:
     for p in packs:
         if rem<=0: break
         k=min(p["limit"], rem//p["amount"])
-        if k>0: total+=k*p["price"]; rem-=k*p["amount"]; buys.append((p["amount"],p["price"],k)); p["limit"]-=k
+        if k>0:
+            total+=k*p["price"]; rem-=k*p["amount"]; buys.append((p["amount"],p["price"],k)); p["limit"]-=k
     while rem>0:
         best_i=-1; best=SINGLE_PRICE
         for i,p in enumerate(packs):
             if p["limit"]<=0: continue
             s=min(p["amount"],rem); eff=p["price"]/s
-            if eff<best-1e-9: best=eff; best_i=i
-        if best_i==-1: total+=rem*SINGLE_PRICE; buys.append((1,SINGLE_PRICE,rem)); rem=0
-        else: p=packs[best_i]; total+=p["price"]; buys.append((p["amount"],p["price"],1)); rem=max(0,rem-p["amount"]); p["limit"]-=1
+            if eff<best-1e-9:
+                best=eff; best_i=i
+        if best_i==-1:
+            total+=rem*SINGLE_PRICE; buys.append((1,SINGLE_PRICE,rem)); rem=0
+        else:
+            p=packs[best_i]; total+=p["price"]; buys.append((p["amount"],p["price"],1)); rem=max(0,rem-p["amount"]); p["limit"]-=1
     agg:Dict[Tuple[int,int],int]={}
-    for a,pr,c in buys: agg[(a,pr)]=agg.get((a,pr),0)+c
+    for a,pr,c in buys:
+        agg[(a,pr)]=agg.get((a,pr),0)+c
     items=sorted(agg.items(), key=lambda kv:(kv[0][1]/kv[0][0],-kv[0][0]))
     plan="\n".join(f"{c}× {a} za {fmt_int(pr)}" for (a,pr),c in items)
     avg= total/req if req>0 else 0.0
     return int(round(total)), plan, avg
 
+# ====== SESJE: Dekoracja ======
 SESS:Dict[int,dict]={}
 def _new_s(): return {"charter":0,"construction":0,"sceat":0,"upgrade":0,"samurai_medals":0,"samurai_tokens":0,"khan_medals":0,"khan_tablets":0,"current_level":0,"current_progress":0,"target_level":0}
 def _s(uid:int)->dict:
@@ -173,7 +284,8 @@ def _spent_lines(s):
     parts=[]
     for k in ORDER:
         v=s.get(k,0)
-        if v and int(v)>0: parts.append(f"{E(k)} **{PL_NAME[k]}:** {fmt_int(v)}")
+        if v and int(v)>0:
+            parts.append(f"{E(k)} **{PL_NAME[k]}:** {fmt_int(v)}")
     return "\n".join(parts) if parts else "—"
 
 def _embed(guild, s, show=False):
@@ -185,8 +297,10 @@ def _embed(guild, s, show=False):
         emb.add_field(name="🧭 Stan początkowy",value=f"Poziom: **{s['current_level']}**\nPunkty w poziomie: **{fmt_int(s['current_progress'])}**",inline=True)
     emb.add_field(name="🧮 Łączne pkt.",value=f"**{fmt_int(gained)}**",inline=True)
     if show:
-        if lv<10: post=f"❗ Nadwyżka: **{fmt_int(prog)}**\n⏭️ Brakuje: **{fmt_int(nxt)}**"
-        else: post=f"❗ Nadwyżka po maks.: **{fmt_int(overflow or 0)}**"
+        if lv<10:
+            post=f"❗ Nadwyżka: **{fmt_int(prog)}**\n⏭️ Brakuje: **{fmt_int(nxt)}**"
+        else:
+            post=f"❗ Nadwyżka po maks.: **{fmt_int(overflow or 0)}**"
         show_lv=max(1,lv); idx=show_lv-1; stats=f"({MELEE[idx]}/{RANGED[idx]}/{COURTY[idx]})"
         post+=f"\n🏛️ Poziom dekoracji: **{show_lv}**  {stats}"
         emb.add_field(name="📈 Postęp",value=post,inline=False)
@@ -199,7 +313,8 @@ def _embed(guild, s, show=False):
         if lv>=10: need=0
         else:
             need=LEVEL_COSTS[lv]-prog
-            for L in range(lv+1,target): need+=LEVEL_COSTS[L]
+            for L in range(lv+1,target):
+                need+=LEVEL_COSTS[L]
         if need>0:
             rub2,plan2,_=best_ruby_cost_for_charters(need)
             emb.add_field(name=f"🎯 Koszt do poziomu {target} (żetony patronatu)",value=(f"Żetony patronatu: **{fmt_int(need)}**\n{E('rubies')} Rubiny: **{fmt_int(rub2)}**\nPlan:\n{plan2}") if plan2 else f"Żetony patronatu: **{fmt_int(need)}**\n{E('rubies')} Rubiny: **{fmt_int(rub2)}**",inline=False)
@@ -218,7 +333,8 @@ class SpendingModal1(discord.ui.Modal, title="Wydatki — 1/2"):
             self.s["charter"]=_to_int(self.charter.value); self.s["sceat"]=_to_int(self.sceat.value)
             self.s["construction"]=_to_int(self.construction.value); self.s["upgrade"]=_to_int(self.upgrade.value)
             await i.response.send_message("Zapisano (1/2). Kliknij **Zapisz**.",ephemeral=True)
-        except: await i.response.send_message("Błąd (1/2).",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd (1/2).",ephemeral=True)
 
 class SpendingModal2(discord.ui.Modal, title="Wydatki — 2/2"):
     def __init__(self, s): super().__init__(custom_id="patronat:m2"); self.s=s
@@ -233,7 +349,8 @@ class SpendingModal2(discord.ui.Modal, title="Wydatki — 2/2"):
             self.s["khan_medals"]=_to_int(self.khan_medals.value)
             self.s["khan_tablets"]=_to_int(self.khan_tablets.value)
             await i.response.send_message("Zapisano (2/2). Kliknij **Zapisz**.",ephemeral=True)
-        except: await i.response.send_message("Błąd (2/2).",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd (2/2).",ephemeral=True)
 
 class StateModal(discord.ui.Modal, title="LVL dekoracji"):
     def __init__(self,s): super().__init__(custom_id="patronat:state"); self.s=s
@@ -246,12 +363,15 @@ class StateModal(discord.ui.Modal, title="LVL dekoracji"):
             self.s["current_progress"]=max(0,_to_int(self.progress.value or 0))
             self.s["target_level"]=max(0,min(10,_to_int(self.target.value or 0)))
             await i.response.send_message("Parametry zapisane. Kliknij **Zapisz**.",ephemeral=True)
-        except: await i.response.send_message("Błąd.",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd.",ephemeral=True)
 
 class DekorView(discord.ui.View):
     def __init__(self,uid): super().__init__(timeout=600); self.uid=uid
     async def interaction_check(self,i):
-        if i.user.id!=self.uid: await i.response.send_message("To prywatny panel innego użytkownika.",ephemeral=True); return False
+        if i.user.id!=self.uid:
+            await i.response.send_message("To prywatny panel innego użytkownika.",ephemeral=True)
+            return False
         return True
     @discord.ui.button(label="1",style=discord.ButtonStyle.primary,emoji="🧾")
     async def b1(self,i,_): await i.response.send_modal(SpendingModal1(_s(self.uid)))
@@ -264,7 +384,8 @@ class DekorView(discord.ui.View):
     @discord.ui.button(label="Wyczyść",style=discord.ButtonStyle.danger,emoji="🧹")
     async def b5(self,i,_): SESS[self.uid]=_new_s(); await i.response.edit_message(embed=_embed(i.guild,_s(self.uid),False),view=self)
 
-@tree.command(name="patronat",description="Panel liczenia dekoracji")
+# ====== KOMENDY ======
+@app_commands.command(name="patronat",description="Panel liczenia dekoracji")
 async def patronat_cmd(i:discord.Interaction):
     await i.response.send_message(embed=_embed(i.guild,_s(i.user.id),False),view=DekorView(i.user.id),ephemeral=True)
 
@@ -310,7 +431,9 @@ def _liga_embed(g,s):
         post=f"❗ Nadwyżka: **{fmt_int(inb)}**\n⏭️ Brakuje: **{fmt_int(need)}**\n"
         one=weak_one(need)
         if one: post+=f"🗓️ Dziś wystarczy: {M(one)} ({PTS[one]})"
-        else: k1,k2=weak_two(need); post+=f"🗓️ W 2 dni: {M(k1)} + {M(k2)} ({PTS[k1]}+{PTS[k2]})"
+        else:
+            k1,k2=weak_two(need)
+            post+=f"🗓️ W 2 dni: {M(k1)} + {M(k2)} ({PTS[k1]}+{PTS[k2]})"
         emb.add_field(name="🏆 Tytuł",value=f"{TITLE_EMOJI} **{cur}** → następny: **{nxt}**",inline=True)
         emb.add_field(name="📈 Postęp",value=post,inline=False)
     else:
@@ -328,7 +451,8 @@ class L1(discord.ui.Modal, title="Medale — 1/2"):
         try:
             self.s["gold"]=_to_int(self.gold.value); self.s["silver"]=_to_int(self.silver.value); self.s["bronze"]=_to_int(self.bronze.value); self.s["glass"]=_to_int(self.glass.value)
             await i.response.send_message("Zapisano (1/2). Kliknij **Zapisz**.",ephemeral=True)
-        except: await i.response.send_message("Błąd (1/2).",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd (1/2).",ephemeral=True)
 
 class L2(discord.ui.Modal, title="Medale — 2/2"):
     def __init__(self,s): super().__init__(custom_id="liga:m2"); self.s=s
@@ -339,12 +463,15 @@ class L2(discord.ui.Modal, title="Medale — 2/2"):
         try:
             self.s["copper"]=_to_int(self.copper.value); self.s["stone"]=_to_int(self.stone.value); self.s["wood"]=_to_int(self.wood.value)
             await i.response.send_message("Zapisano (2/2). Kliknij **Zapisz**.",ephemeral=True)
-        except: await i.response.send_message("Błąd (2/2).",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd (2/2).",ephemeral=True)
 
 class LigaView(discord.ui.View):
     def __init__(self,uid): super().__init__(timeout=600); self.uid=uid
     async def interaction_check(self,i):
-        if i.user.id!=self.uid: await i.response.send_message("To prywatny panel innego użytkownika.",ephemeral=True); return False
+        if i.user.id!=self.uid:
+            await i.response.send_message("To prywatny panel innego użytkownika.",ephemeral=True)
+            return False
         return True
     @discord.ui.button(label="1",style=discord.ButtonStyle.primary,emoji="🎖️")
     async def a(self,i,_): await i.response.send_modal(L1(_l(self.uid)))
@@ -355,13 +482,15 @@ class LigaView(discord.ui.View):
     @discord.ui.button(label="Wyczyść",style=discord.ButtonStyle.danger,emoji="🧹")
     async def d(self,i,_): LIGA[self.uid]=_new_l(); await i.response.edit_message(embed=_liga_embed(i.guild,_l(self.uid)),view=self)
 
-@tree.command(name="liga",description="Policz tytuł z medali")
+@app_commands.command(name="liga",description="Policz tytuł z medali")
 async def liga_cmd(i:discord.Interaction):
     await i.response.send_message(embed=_liga_embed(i.guild,_l(i.user.id)),view=LigaView(i.user.id),ephemeral=True)
 
+# ====== ZBIERACZ ======
 def required_today(current:int,days_left:int,target:int,mult:float=1.35)->int:
     days_left=max(0,int(days_left)); current=max(0,int(current)); target=max(0,int(target))
     need_base= target/(mult**days_left); return max(0, math.ceil(need_base-current))
+
 class ZbieraczModal(discord.ui.Modal, title="Zbieracz — kalkulator"):
     def __init__(self): super().__init__(custom_id="zbieracz:m")
     cur=discord.ui.TextInput(label="Twoje punkty teraz",required=True)
@@ -377,27 +506,41 @@ class ZbieraczModal(discord.ui.Modal, title="Zbieracz — kalkulator"):
             e.add_field(name="🧮 Musisz zdobyć DZIŚ",value=f"**{fmt_int(need)}** pkt",inline=False)
             e.add_field(name="🔮 Po tylu pkt. dziś, na koniec będzie",value=f"**{fmt_int(projected)}** pkt",inline=False)
             await i.response.send_message(embed=e,ephemeral=True)
-        except: await i.response.send_message("Błąd podczas obliczeń.",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd podczas obliczeń.",ephemeral=True)
 
-@tree.command(name="zbieracz",description="Kalkulator eventu Zbieracz")
-async def zbieracz_cmd(i:discord.Interaction): await i.response.send_modal(ZbieraczModal())
+@app_commands.command(name="zbieracz",description="Kalkulator eventu Zbieracz")
+async def zbieracz_cmd(i:discord.Interaction):
+    await i.response.send_modal(ZbieraczModal())
 
-@tree.command(name="pomoc",description="Lista komend")
+@app_commands.command(name="pomoc",description="Lista komend")
 async def pomoc(i:discord.Interaction):
     d="**/patronat** — panel dekoracji\n**/liga** — tytuł z medali\n**/zbieracz** — ile musisz dziś zdobyć"
     await i.response.send_message(embed=discord.Embed(title="📚 Pomoc",description=d,color=0x3498DB),ephemeral=True)
 
 if OWNER_ID:
-    @tree.command(name="shutdown",description="Owner: wyłącz bota")
+    @app_commands.command(name="shutdown",description="Owner: wyłącz bota")
     async def shutdown(i:discord.Interaction):
-        if i.user.id!=int(OWNER_ID): return await i.response.send_message("Brak uprawnień.",ephemeral=True)
-        await i.response.send_message("Wyłączam się…",ephemeral=True); await client.close()
+        if i.user.id!=int(OWNER_ID):
+            return await i.response.send_message("Brak uprawnień.",ephemeral=True)
+        await i.response.send_message("Wyłączam się…",ephemeral=True)
+        await client.close()
 
+# lista komend do rejestracji
+ALL_CMDS=[patronat_cmd, liga_cmd, zbieracz_cmd, pomoc]
+if OWNER_ID: ALL_CMDS.append(shutdown)
+
+# ====== LIFECYCLE ======
 @client.event
 async def on_ready():
-    logging.basicConfig(level=logging.INFO)
-    await client.change_presence(activity=None,status=discord.Status.online)
+    await client.change_presence(activity=None, status=discord.Status.online)
     await load_hub_emoji()
-    logging.info(f"Wczytano emoji z huba: {len(HUB_EMOJI_ID)}")
+    log.info(f"Wczytano emoji z huba: {len(HUB_EMOJI_ID)}")
+    gl = await client.tree.fetch_commands()
+    log.info(f"GLOBAL → {[c.name for c in gl]}")
+    for gid in GUILD_IDS:
+        cmds = await client.tree.fetch_commands(guild=discord.Object(id=gid))
+        log.info(f"GUILD {gid} → {[c.name for c in cmds]}")
 
+# START
 client.run(TOKEN)
