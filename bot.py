@@ -32,22 +32,22 @@ def _parse_ids(s: str) -> List[int]:
             logging.warning(f"Pominięto niepoprawne ID: {p!r}")
     return out
 
-GUILD_IDS: List[int] = _parse_ids(os.getenv("GUILD_IDS", ""))  # podaj ID(y) serwerów, na których rejestrujemy komendy
+GUILD_IDS: List[int] = _parse_ids(os.getenv("GUILD_IDS", ""))  # serwery do rejestracji komend
 RUN_MODE = (os.getenv("RUN_MODE") or "bot").strip().lower()    # bot | purge_global | purge_guild | purge_all
 
 if not TOKEN:
     raise RuntimeError("Brak DISCORD_TOKEN (sprawdź .env).")
 
-# ====== STAŁE „PrimeTime” – tylko na głównym serwerze
+# ====== STAŁE „PrimeTime” — tylko na głównym serwerze
 TARGET_GUILD_ID = 1016796563227541574
-WATCH_CHANNEL_ID = 1414146583666364447   # kanał z wiadomościami „A new EM: PT …”
-SIGNUP_CHANNEL_ID = 1415624731293646891  # kanał z panelem reakcji
+WATCH_CHANNEL_ID = 1414146583666364447   # kanał z „A new EM: PT …”
+SIGNUP_CHANNEL_ID = 1415624731293646891  # kanał panelu reakcji
 
 ROLE_300GL_ID = 1415630918529454081      # 300gl
 ROLE_200OR_ID = 1415631072246628433      # 200or
 ROLE_200BTH_ID = 1415631110351622224     # 200bth
 
-TRIGGER_BOT_USER_ID = 1414146769436147783  # autor wiadomości z triggerami
+TRIGGER_BOT_USER_ID = 1414146769436147783  # preferowany autor, ale już nie wymagany
 
 EMOJI_GL = "🟢"
 EMOJI_OR = "🟡"
@@ -58,6 +58,11 @@ SIGNUP_INFO = "Kliknij odpowiednie emoji by dostać ping TYLKO przy następnej p
 
 # cron co 10 min o :03, :13, :23, :33, :43, :53
 CRON_MINUTES = {3, 13, 23, 33, 43, 53}
+
+# Wzorce tekstu (lowercase)
+PAT_300_MAIN = re.compile(r"a new em:\s*pt\s*(300|350)% is starting.*goodgame empire", re.I)
+PAT_200_OR   = re.compile(r"a new em:\s*pt\s*200% is starting.*the outer realms", re.I)
+PAT_200_BTH  = re.compile(r"a new em:\s*pt\s*200% is starting.*beyond the horizon", re.I)
 
 # ================= LOGI =================
 logging.basicConfig(level=logging.INFO)
@@ -119,8 +124,8 @@ if RUN_MODE in {"purge_global", "purge_guild", "purge_all"}:
 # ================== INTENTS / KLIENT ==================
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True               # wymagane (włącz w Dev Portal)
-intents.message_content = True       # wymagane (włącz w Dev Portal)
+intents.members = True               # włącz w Dev Portal
+intents.message_content = True       # włącz w Dev Portal
 intents.reactions = True
 
 class MyClient(discord.Client):
@@ -237,6 +242,7 @@ class MyClient(discord.Client):
                 now = datetime.now(timezone.utc)
                 minute = now.minute
                 if minute in CRON_MINUTES:
+                    log.info("[POLL] Cron tick — skanuję historię…")
                     await self._poll_once()
                     await asyncio.sleep(60)
                 else:
@@ -259,22 +265,34 @@ class MyClient(discord.Client):
                 newest_ts = max(newest_ts, m.created_at or newest_ts)
                 if m.id in self._seen_message_ids:
                     continue
-                if m.author.id != TRIGGER_BOT_USER_ID:
-                    continue
-                await self._maybe_trigger_from_text(m.content or "")
+                await self._maybe_trigger_from_message(m)
                 self._seen_message_ids.add(m.id)
         except Exception as e:
             log.warning(f"[POLL] history error: {e}")
         self._last_poll_ts = newest_ts or datetime.now(timezone.utc)
 
-    async def _maybe_trigger_from_text(self, text: str):
-        s = (text or "").lower()
-        if ("a new em: pt 300% is starting" in s and "goodgame empire" in s) or ("a new em: pt 350% is starting" in s and "goodgame empire" in s):
-            await self._fire_ping_and_cleanup(kind="300gl", role_id=ROLE_300GL_ID, label="300% PrimeTime na głównym serwerze")
-        elif ("a new em: pt 200% is starting" in s and "the outer realms" in s):
-            await self._fire_ping_and_cleanup(kind="200or", role_id=ROLE_200OR_ID, label="200% PrimeTime na zewnętrzynych")
-        elif ("a new em: pt 200% is starting" in s and "beyond the horizon" in s):
-            await self._fire_ping_and_cleanup(kind="200bth", role_id=ROLE_200BTH_ID, label="200% PrimeTime na horyzoncie")
+    async def _maybe_trigger_from_message(self, m: discord.Message):
+        content = m.content or ""
+        author_ok = (m.author.id == TRIGGER_BOT_USER_ID) or bool(getattr(m.author, "bot", False))
+        if not author_ok:
+            log.info(f"[SCAN] pomijam (autor != trigger i nie bot): {m.author} ({m.author.id})")
+            return
+
+        txt = content.strip()
+        low = txt.lower()
+        matched = None
+        if PAT_300_MAIN.search(txt):
+            matched = ("300gl", ROLE_300GL_ID, "300% PrimeTime na głównym serwerze")
+        elif PAT_200_OR.search(txt):
+            matched = ("200or", ROLE_200OR_ID, "200% PrimeTime na zewnętrzynych")
+        elif PAT_200_BTH.search(txt):
+            matched = ("200bth", ROLE_200BTH_ID, "200% PrimeTime na horyzoncie")
+
+        log.info(f"[SCAN] msg {m.id} od {m.author} ({m.author.id}) match={bool(matched)}: {txt[:120]}")
+
+        if matched:
+            kind, role_id, label = matched
+            await self._fire_ping_and_cleanup(kind=kind, role_id=role_id, label=label)
 
     async def _fire_ping_and_cleanup(self, kind: str, role_id: int, label: str):
         guild = self.get_guild(TARGET_GUILD_ID)
@@ -288,9 +306,9 @@ class MyClient(discord.Client):
             log.warning(f"[PING] Brak roli {role_id}")
             return
 
-        members_with_role = [m for m in guild.members if role in m.roles]
+        members_with_role = list(role.members)  # szybciej i pewniej niż pełne przeszukiwanie cache
+        log.info(f"[PING] {label} — zapisanych: {len(members_with_role)}")
         if not members_with_role:
-            log.info(f"[PING] Nikt nie zapisał się na {label}, pomijam ping.")
             return
 
         mention_line = role.mention
@@ -337,10 +355,10 @@ class MyClient(discord.Client):
     async def on_message(self, message: discord.Message):
         if not isinstance(message.channel, discord.TextChannel):
             return
-        if message.guild and message.guild.id == TARGET_GUILD_ID and message.channel.id == WATCH_CHANNEL_ID and message.author.id == TRIGGER_BOT_USER_ID:
+        if message.guild and message.guild.id == TARGET_GUILD_ID and message.channel.id == WATCH_CHANNEL_ID:
             if message.id in self._seen_message_ids:
                 return
-            await self._maybe_trigger_from_text(message.content or "")
+            await self._maybe_trigger_from_message(message)
             self._seen_message_ids.add(message.id)
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
@@ -408,7 +426,7 @@ class MyClient(discord.Client):
 client = MyClient()
 tree = client.tree
 
-# ================== UTYLITKI ==================
+# ================== UTYLITKI (pozostałe komendy) ==================
 def fmt_int(x): return f"{int(round(float(x))):,}".replace(","," ")
 def _to_int(s):
     try:
@@ -418,12 +436,9 @@ def _to_int(s):
 def _pl_dni(n:int)->str:
     return "1 dzień" if int(n)==1 else f"{int(n)} dni"
 def _sev_emoji(days:int)->str:
-    if days <= 1:
-        return "🔴"
-    elif days <= 9:
-        return "🟠"
-    else:
-        return "🟢"
+    if days <= 1: return "🔴"
+    elif days <= 9: return "🟠"
+    else: return "🟢"
 
 HUB_EMOJI_ID: Dict[str,int] = {}
 HUB_NAMES = {
@@ -586,7 +601,7 @@ def days_until_below_berimond(current: int, threshold: int) -> int:
         if days > 10000: break
     return days
 
-# ================== PANEL DEKORACJI ==================
+# ================== PANEL DEKORACJI / LIGA / ZBIERACZ / TYTUŁ ==================
 SESS:Dict[int,dict]={}
 def _new_s(): return {"charter":0,"construction":0,"sceat":0,"upgrade":0,"samurai_medals":0,"samurai_tokens":0,"khan_medals":0,"khan_tablets":0,"current_level":0,"current_progress":0,"target_level":0}
 def _s(uid:int)->dict:
@@ -896,7 +911,7 @@ async def tytul_cmd(i: discord.Interaction):
                 await inter.response.send_message("Błąd obliczeń.", ephemeral=True)
     await i.response.send_modal(TytulModal())
 
-# >>> Narzędzie diagnostyczne: wymuś panel + raport uprawnień
+# >>> Diagnostyka: wymuś panel + sprawdź perms
 @app_commands.command(name="ptsetup", description="[ADMIN] Wymuś panel PrimeTime i pokaż uprawnienia")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ptsetup_cmd(i: discord.Interaction):
