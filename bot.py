@@ -1,10 +1,14 @@
+# bot.py
 from __future__ import annotations
-import os, re, math, logging, sys
-from typing import Dict, List, Tuple, Optional
+import os, re, math, logging, sys, asyncio
+from typing import Dict, List, Tuple, Optional, Set
+from datetime import datetime, timedelta, timezone
+
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+# ===================== ENV / KONFIG =====================
 load_dotenv(override=True)
 
 def _clean_token(raw: str) -> str:
@@ -28,17 +32,40 @@ def _parse_ids(s: str) -> List[int]:
             logging.warning(f"Pominięto niepoprawne ID: {p!r}")
     return out
 
-GUILD_IDS: List[int] = _parse_ids(os.getenv("GUILD_IDS", ""))
-RUN_MODE = (os.getenv("RUN_MODE") or "bot").strip().lower()
+GUILD_IDS: List[int] = _parse_ids(os.getenv("GUILD_IDS", ""))  # podaj ID(y) serwerów, na których rejestrujemy komendy
+RUN_MODE = (os.getenv("RUN_MODE") or "bot").strip().lower()    # bot | purge_global | purge_guild | purge_all
 
 if not TOKEN:
     raise RuntimeError("Brak DISCORD_TOKEN (sprawdź .env).")
 
+# ====== STAŁE „PrimeTime” – tylko na głównym serwerze
+TARGET_GUILD_ID = 1016796563227541574
+WATCH_CHANNEL_ID = 1414146583666364447   # kanał z wiadomościami „A new EM: PT …”
+SIGNUP_CHANNEL_ID = 1415624731293646891  # kanał z panelem reakcji
+
+ROLE_300GL_ID = 1415630918529454081      # 300gl
+ROLE_200OR_ID = 1415631072246628433      # 200or
+ROLE_200BTH_ID = 1415631110351622224     # 200bth
+
+TRIGGER_BOT_USER_ID = 1414146769436147783  # autor wiadomości z triggerami
+
+EMOJI_GL = "🟢"
+EMOJI_OR = "🟡"
+EMOJI_BTH = "🌊"
+
+SIGNUP_MARKER = "## PrimeTime na Ruble"
+SIGNUP_INFO = "Kliknij odpowiednie emoji by dostać ping TYLKO przy następnej premce na ruble:"
+
+# cron co 10 min o :03, :13, :23, :33, :43, :53
+CRON_MINUTES = {3, 13, 23, 33, 43, 53}
+
+# ================= LOGI =================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discord")
 logger.setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
+# ================== PURGE TRYBY ==================
 intents_min = discord.Intents.none()
 intents_min.guilds = True
 
@@ -89,12 +116,22 @@ if RUN_MODE in {"purge_global", "purge_guild", "purge_all"}:
             discord.Client(intents=intents_min).close()
     sys.exit(0)
 
+# ================== INTENTS / KLIENT ==================
 intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True               # wymagane (włącz w Dev Portal)
+intents.message_content = True       # wymagane (włącz w Dev Portal)
+intents.reactions = True
 
 class MyClient(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.signup_message_id: Optional[int] = None
+        self._poll_task: Optional[asyncio.Task] = None
+        self._seen_message_ids: Set[int] = set()
+        self._last_poll_ts: datetime = datetime.now(timezone.utc) - timedelta(minutes=15)
+
     async def setup_hook(self):
         try:
             self.tree.clear_commands(guild=None)
@@ -102,6 +139,7 @@ class MyClient(discord.Client):
             log.info("Globalne komendy wyczyszczone.")
         except Exception as e:
             log.warning(f"Nie udało się wyczyścić globalnych: {e}")
+
         if not GUILD_IDS:
             for cmd in ALL_CMDS:
                 try: self.tree.add_command(cmd)
@@ -122,9 +160,255 @@ class MyClient(discord.Client):
                 except Exception as e:
                     log.warning(f"fetch_commands({gid}) nieudane: {e}")
 
+        await self._post_signup_message()
+        if self._poll_task is None:
+            self._poll_task = asyncio.create_task(self._poll_loop())
+        asyncio.create_task(self._post_signup_after_ready())
+
+    async def _post_signup_after_ready(self):
+        await self.wait_until_ready()
+        await asyncio.sleep(2)
+        if not self.signup_message_id:
+            await self._post_signup_message()
+
+    def _perm_report(self, ch: discord.TextChannel, me: discord.Member) -> Dict[str, bool]:
+        p = ch.permissions_for(me)
+        return {
+            "view_channel": p.view_channel,
+            "send_messages": p.send_messages,
+            "read_message_history": p.read_message_history,
+            "add_reactions": p.add_reactions,
+            "manage_messages": p.manage_messages,
+            "mention_everyone/roles": p.mention_everyone,
+            "manage_roles (global)": me.guild_permissions.manage_roles,
+        }
+
+    async def _post_signup_message(self):
+        guild = self.get_guild(TARGET_GUILD_ID)
+        if not guild:
+            log.warning("[SIGNUP] Brak docelowej gildii albo bot nie jest na serwerze.")
+            return
+        ch = guild.get_channel(SIGNUP_CHANNEL_ID)
+        if not isinstance(ch, discord.TextChannel):
+            log.warning("[SIGNUP] Nie widzę kanału zapisów (zły ID? brak dostępu?).")
+            return
+
+        me = guild.get_member(self.user.id) if self.user else None
+        if not isinstance(me, discord.Member):
+            log.warning("[SIGNUP] Nie mogę pobrać siebie (Member).")
+            return
+
+        rep = self._perm_report(ch, me)
+        log.info(f"[SIGNUP] Perms w kanale {ch.id}: {rep}")
+
+        try:
+            async for m in ch.history(limit=50, oldest_first=False):
+                if m.author.id == self.user.id and SIGNUP_MARKER in (m.content or ""):
+                    self.signup_message_id = m.id
+                    log.info(f"[SIGNUP] Znalazłem istniejący panel: {m.id}")
+                    return
+        except Exception as e:
+            log.warning(f"[SIGNUP] Nie mogę czytać historii: {e}")
+
+        if not (rep["view_channel"] and rep["send_messages"] and rep["add_reactions"]):
+            log.warning("[SIGNUP] Brakuje uprawnień do utworzenia panelu.")
+            return
+
+        lines = [
+            SIGNUP_MARKER,
+            SIGNUP_INFO,
+            "",
+            f"{EMOJI_GL} 300% PrimeTime na głownym serwerze",
+            f"{EMOJI_OR} 200% PrimeTime na zewnętrzynych",
+            f"{EMOJI_BTH} 200% PrimeTime na horyzoncie",
+        ]
+        msg = await ch.send("\n".join(lines))
+        self.signup_message_id = msg.id
+        for e in (EMOJI_GL, EMOJI_OR, EMOJI_BTH):
+            try:
+                await msg.add_reaction(e)
+            except Exception as e:
+                log.warning(f"[SIGNUP] add_reaction {e}")
+
+    async def _poll_loop(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                now = datetime.now(timezone.utc)
+                minute = now.minute
+                if minute in CRON_MINUTES:
+                    await self._poll_once()
+                    await asyncio.sleep(60)
+                else:
+                    await asyncio.sleep(5)
+            except Exception as e:
+                log.warning(f"[POLL] wyjątek: {e}")
+                await asyncio.sleep(10)
+
+    async def _poll_once(self):
+        guild = self.get_guild(TARGET_GUILD_ID)
+        if not guild:
+            return
+        ch = guild.get_channel(WATCH_CHANNEL_ID)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        cutoff = self._last_poll_ts
+        newest_ts = cutoff
+        try:
+            async for m in ch.history(limit=50, oldest_first=False, after=cutoff):
+                newest_ts = max(newest_ts, m.created_at or newest_ts)
+                if m.id in self._seen_message_ids:
+                    continue
+                if m.author.id != TRIGGER_BOT_USER_ID:
+                    continue
+                await self._maybe_trigger_from_text(m.content or "")
+                self._seen_message_ids.add(m.id)
+        except Exception as e:
+            log.warning(f"[POLL] history error: {e}")
+        self._last_poll_ts = newest_ts or datetime.now(timezone.utc)
+
+    async def _maybe_trigger_from_text(self, text: str):
+        s = (text or "").lower()
+        if ("a new em: pt 300% is starting" in s and "goodgame empire" in s) or ("a new em: pt 350% is starting" in s and "goodgame empire" in s):
+            await self._fire_ping_and_cleanup(kind="300gl", role_id=ROLE_300GL_ID, label="300% PrimeTime na głównym serwerze")
+        elif ("a new em: pt 200% is starting" in s and "the outer realms" in s):
+            await self._fire_ping_and_cleanup(kind="200or", role_id=ROLE_200OR_ID, label="200% PrimeTime na zewnętrzynych")
+        elif ("a new em: pt 200% is starting" in s and "beyond the horizon" in s):
+            await self._fire_ping_and_cleanup(kind="200bth", role_id=ROLE_200BTH_ID, label="200% PrimeTime na horyzoncie")
+
+    async def _fire_ping_and_cleanup(self, kind: str, role_id: int, label: str):
+        guild = self.get_guild(TARGET_GUILD_ID)
+        if not guild:
+            return
+        ch = guild.get_channel(WATCH_CHANNEL_ID)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        role = guild.get_role(role_id)
+        if not role:
+            log.warning(f"[PING] Brak roli {role_id}")
+            return
+
+        members_with_role = [m for m in guild.members if role in m.roles]
+        if not members_with_role:
+            log.info(f"[PING] Nikt nie zapisał się na {label}, pomijam ping.")
+            return
+
+        mention_line = role.mention
+        can_edit_mentionable = guild.me.guild_permissions.manage_roles and role.position < guild.me.top_role.position
+        changed_flag = False
+        try:
+            if not role.mentionable and can_edit_mentionable:
+                await role.edit(mentionable=True, reason="Tymczasowo, by pingnąć zapisanych")
+                changed_flag = True
+        except Exception as e:
+            log.warning(f"[PING] Nie mogę ustawić mentionable dla roli {role.id}: {e}")
+
+        try:
+            await ch.send(f"{mention_line} — {label} wystartował!")
+        except Exception as e:
+            log.warning(f"[PING] Nie mogę wysłać pingu: {e}")
+
+        if changed_flag:
+            try:
+                await role.edit(mentionable=False, reason="Przywrócenie poprzedniego stanu")
+            except Exception as e:
+                log.warning(f"[PING] Nie mogę cofnąć mentionable: {e}")
+
+        for m in members_with_role:
+            try:
+                await m.remove_roles(role, reason="Jednorazowy ping wykorzystany")
+            except Exception as e:
+                log.warning(f"[CLEANUP] remove_roles({m.id}): {e}")
+
+        if self.signup_message_id:
+            try:
+                signup_ch = guild.get_channel(SIGNUP_CHANNEL_ID)
+                if isinstance(signup_ch, discord.TextChannel):
+                    msg = await signup_ch.fetch_message(self.signup_message_id)
+                    target_emoji = EMOJI_GL if kind=="300gl" else EMOJI_OR if kind=="200or" else EMOJI_BTH
+                    for m in members_with_role:
+                        try:
+                            await msg.remove_reaction(target_emoji, m)
+                        except Exception:
+                            pass
+            except Exception as e:
+                log.warning(f"[CLEANUP] remove_reaction: {e}")
+
+    async def on_message(self, message: discord.Message):
+        if not isinstance(message.channel, discord.TextChannel):
+            return
+        if message.guild and message.guild.id == TARGET_GUILD_ID and message.channel.id == WATCH_CHANNEL_ID and message.author.id == TRIGGER_BOT_USER_ID:
+            if message.id in self._seen_message_ids:
+                return
+            await self._maybe_trigger_from_text(message.content or "")
+            self._seen_message_ids.add(message.id)
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if payload.guild_id != TARGET_GUILD_ID:
+            return
+        if payload.channel_id != SIGNUP_CHANNEL_ID:
+            return
+        if payload.user_id == self.user.id:
+            return
+        guild = self.get_guild(payload.guild_id)
+        if not guild:
+            return
+        member = guild.get_member(payload.user_id)
+        if not member:
+            return
+        if self.signup_message_id and payload.message_id != self.signup_message_id:
+            return
+
+        emoji_str = str(payload.emoji)
+        role: Optional[discord.Role] = None
+        if emoji_str == EMOJI_GL:
+            role = guild.get_role(ROLE_300GL_ID)
+        elif emoji_str == EMOJI_OR:
+            role = guild.get_role(ROLE_200OR_ID)
+        elif emoji_str == EMOJI_BTH:
+            role = guild.get_role(ROLE_200BTH_ID)
+
+        if role is None:
+            return
+        try:
+            await member.add_roles(role, reason="Zapisy na 1x ping PrimeTime")
+        except Exception as e:
+            log.warning(f"[REACTION_ADD] add_roles: {e}")
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        if payload.guild_id != TARGET_GUILD_ID:
+            return
+        if payload.channel_id != SIGNUP_CHANNEL_ID:
+            return
+        if self.signup_message_id and payload.message_id != self.signup_message_id:
+            return
+
+        guild = self.get_guild(payload.guild_id)
+        if not guild:
+            return
+        member = guild.get_member(payload.user_id)
+        if not member:
+            return
+
+        emoji_str = str(payload.emoji)
+        role: Optional[discord.Role] = None
+        if emoji_str == EMOJI_GL:
+            role = guild.get_role(ROLE_300GL_ID)
+        elif emoji_str == EMOJI_OR:
+            role = guild.get_role(ROLE_200OR_ID)
+        elif emoji_str == EMOJI_BTH:
+            role = guild.get_role(ROLE_200BTH_ID)
+        if role is None:
+            return
+        try:
+            await member.remove_roles(role, reason="Wypis z pingu PrimeTime")
+        except Exception as e:
+            log.warning(f"[REACTION_REMOVE] remove_roles: {e}")
+
 client = MyClient()
 tree = client.tree
 
+# ================== UTYLITKI ==================
 def fmt_int(x): return f"{int(round(float(x))):,}".replace(","," ")
 def _to_int(s):
     try:
@@ -302,6 +586,7 @@ def days_until_below_berimond(current: int, threshold: int) -> int:
         if days > 10000: break
     return days
 
+# ================== PANEL DEKORACJI ==================
 SESS:Dict[int,dict]={}
 def _new_s(): return {"charter":0,"construction":0,"sceat":0,"upgrade":0,"samurai_medals":0,"samurai_tokens":0,"khan_medals":0,"khan_tablets":0,"current_level":0,"current_progress":0,"target_level":0}
 def _s(uid:int)->dict:
@@ -413,6 +698,7 @@ class DekorView(discord.ui.View):
     @discord.ui.button(label="Wyczyść",style=discord.ButtonStyle.danger,emoji="🧹")
     async def b5(self,i,_): SESS[self.uid]=_new_s(); await i.response.edit_message(embed=_embed(i.guild,_s(self.uid),False),view=self)
 
+# ================== KOMENDY ==================
 @app_commands.command(name="pomoc",description="Lista komend")
 async def pomoc(i:discord.Interaction):
     d=(
@@ -610,8 +896,25 @@ async def tytul_cmd(i: discord.Interaction):
                 await inter.response.send_message("Błąd obliczeń.", ephemeral=True)
     await i.response.send_modal(TytulModal())
 
-ALL_CMDS=[pomoc, patronat_cmd, liga_cmd, tytul_cmd, zbieracz_cmd]
+# >>> Narzędzie diagnostyczne: wymuś panel + raport uprawnień
+@app_commands.command(name="ptsetup", description="[ADMIN] Wymuś panel PrimeTime i pokaż uprawnienia")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ptsetup_cmd(i: discord.Interaction):
+    if not i.guild or i.guild.id != TARGET_GUILD_ID:
+        return await i.response.send_message("Ta komenda działa tylko na głównym serwerze.", ephemeral=True)
+    await client._post_signup_message()
+    g = i.guild
+    ch = g.get_channel(SIGNUP_CHANNEL_ID)
+    me = g.get_member(client.user.id) if client.user else None
+    rep = client._perm_report(ch, me) if isinstance(ch, discord.TextChannel) and isinstance(me, discord.Member) else {}
+    await i.response.send_message(
+        f"OK. signup_message_id={client.signup_message_id}\nPerms: {rep}",
+        ephemeral=True
+    )
 
+ALL_CMDS=[pomoc, patronat_cmd, liga_cmd, tytul_cmd, zbieracz_cmd, ptsetup_cmd]
+
+# ================== LIFECYCLE ==================
 @client.event
 async def on_ready():
     await client.change_presence(activity=None, status=discord.Status.online)
@@ -623,4 +926,5 @@ async def on_ready():
         cmds = await client.tree.fetch_commands(guild=discord.Object(id=gid))
         log.info(f"GUILD {gid} → {[c.name for c in cmds]}")
 
+# ================== START ==================
 client.run(TOKEN)
