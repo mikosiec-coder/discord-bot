@@ -1,14 +1,12 @@
-# bot.py
 from __future__ import annotations
-import os, re, math, logging, sys, asyncio
+import os, re, math, logging, asyncio
 from typing import Dict, List, Tuple, Optional, Set
 from datetime import datetime, timedelta, timezone
-
+from dotenv import load_dotenv
 import discord
 from discord import app_commands
-from dotenv import load_dotenv
 
-# ===================== ENV / KONFIG =====================
+logging.getLogger("discord.client").setLevel(logging.ERROR)
 load_dotenv(override=True)
 
 def _clean_token(raw: str) -> str:
@@ -18,7 +16,8 @@ def _clean_token(raw: str) -> str:
     return t
 
 TOKEN = _clean_token(os.getenv("DISCORD_TOKEN") or "")
-HUB_ID = int(os.getenv("EMOJI_HUB_ID") or 0)
+if not TOKEN:
+    raise RuntimeError("Brak DISCORD_TOKEN (.env).")
 
 def _parse_ids(s: str) -> List[int]:
     parts = re.split(r"[,\s;]+", (s or "").strip())
@@ -29,404 +28,334 @@ def _parse_ids(s: str) -> List[int]:
         try:
             out.append(int(p))
         except:
-            logging.warning(f"Pominięto niepoprawne ID: {p!r}")
+            pass
     return out
 
-GUILD_IDS: List[int] = _parse_ids(os.getenv("GUILD_IDS", ""))  # serwery do rejestracji komend
-RUN_MODE = (os.getenv("RUN_MODE") or "bot").strip().lower()    # bot | purge_global | purge_guild | purge_all
+GUILD_IDS: List[int] = _parse_ids(os.getenv("GUILD_IDS", ""))
 
-if not TOKEN:
-    raise RuntimeError("Brak DISCORD_TOKEN (sprawdź .env).")
+MAIN_GUILD_ID = 1016796563227541574
+EM_CHANNEL_ID = 1414146583666364447
+SIGNUP_CHANNEL_ID = 1415624731293646891
+SIGNUP_MESSAGE_ID_ENV = int(os.getenv("SIGNUP_MESSAGE_ID") or 0)
+ALLOWED_EM_AUTHOR_IDS = {1414146769436147783, 353121781630107658}
 
-# ====== STAŁE „PrimeTime” — tylko na głównym serwerze
-TARGET_GUILD_ID = 1016796563227541574
-WATCH_CHANNEL_ID = 1414146583666364447   # kanał z „A new EM: PT …”
-SIGNUP_CHANNEL_ID = 1415624731293646891  # kanał panelu reakcji
+ROLE_PREMKA300 = 1415630918529454081
+ROLE_PREMKAZWK = 1415631072246628433
+ROLE_PREMKAHORY = 1415631110351622224
 
-ROLE_300GL_ID = 1415630918529454081      # 300gl
-ROLE_200OR_ID = 1415631072246628433      # 200or
-ROLE_200BTH_ID = 1415631110351622224     # 200bth
+EMOJI_300GL = "🟩"
+EMOJI_200OR  = "🟨"
+EMOJI_200BTH = "🟦"
 
-TRIGGER_BOT_USER_ID = 1414146769436147783  # preferowany autor, ale już nie wymagany
-
-EMOJI_GL = "🟢"
-EMOJI_OR = "🟡"
-EMOJI_BTH = "🌊"
+MATCH_300GL = (
+    "A new EM: PT 300% is starting in GoodGame Empire.",
+    "A new EM: PT 350% is starting in GoodGame Empire.",
+)
+MATCH_200OR = ("A new EM: PT 200% is starting in the Outer Realms.",)
+MATCH_200BTH = ("A new EM: PT 200% is starting in Beyond the Horizon.",)
 
 SIGNUP_MARKER = "## PrimeTime na Ruble"
-SIGNUP_INFO = "Kliknij odpowiednie emoji by dostać ping TYLKO przy następnej premce na ruble:"
+SIGNUP_LEAD = "Kliknij odpowiednie emoji by dostać ping TYLKO przy następnej premce na ruble:"
+SIGNUP_TEXT = (
+    f"{SIGNUP_MARKER}\n"
+    f"{SIGNUP_LEAD}\n\n"
+    f"{EMOJI_300GL} — **300% PrimeTime na głównym serwerze**\n"
+    f"{EMOJI_200OR} — **200% PrimeTime na zewnętrznych**\n"
+    f"{EMOJI_200BTH} — **200% PrimeTime na horyzoncie**\n"
+    f"\nPo pingnięciu przy najbliższym wydarzeniu rola i Twoja reakcja zostaną zdjęte (one-shot)."
+)
 
-# cron co 10 min o :03, :13, :23, :33, :43, :53
-CRON_MINUTES = {3, 13, 23, 33, 43, 53}
+EMOJI_TO_ROLE = {
+    EMOJI_300GL: ROLE_PREMKA300,
+    EMOJI_200OR: ROLE_PREMKAZWK,
+    EMOJI_200BTH: ROLE_PREMKAHORY,
+}
 
-# Wzorce tekstu (lowercase)
-PAT_300_MAIN = re.compile(r"a new em:\s*pt\s*(300|350)% is starting.*goodgame empire", re.I)
-PAT_200_OR   = re.compile(r"a new em:\s*pt\s*200% is starting.*the outer realms", re.I)
-PAT_200_BTH  = re.compile(r"a new em:\s*pt\s*200% is starting.*beyond the horizon", re.I)
-
-# ================= LOGI =================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("discord")
-logger.setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
-# ================== PURGE TRYBY ==================
-intents_min = discord.Intents.none()
-intents_min.guilds = True
-
-async def _purge_global():
-    class Cleaner(discord.Client):
-        def __init__(self):
-            super().__init__(intents=intents_min)
-            self.tree = app_commands.CommandTree(self)
-        async def setup_hook(self):
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-            left = await self.tree.fetch_commands()
-            log.info(f"[PURGE_GLOBAL] Globalne po czyszczeniu: {[c.name for c in left]}")
-            await self.close()
-    Cleaner().run(TOKEN)
-
-async def _purge_guilds(guild_ids: List[int]):
-    if not guild_ids:
-        log.error("Brak GUILD_IDS do purge_guild.")
-        return
-    class Cleaner(discord.Client):
-        def __init__(self, gids: List[int]):
-            super().__init__(intents=intents_min)
-            self.tree = app_commands.CommandTree(self)
-            self.gids = gids
-        async def setup_hook(self):
-            for gid in self.gids:
-                g = discord.Object(id=gid)
-                self.tree.clear_commands(guild=g)
-                await self.tree.sync(guild=g)
-                left = await self.tree.fetch_commands(guild=g)
-                log.info(f"[PURGE_GUILD] {gid}: {[c.name for c in left]}")
-            await self.close()
-    Cleaner(guild_ids).run(TOKEN)
-
-if RUN_MODE in {"purge_global", "purge_guild", "purge_all"}:
-    if RUN_MODE in {"purge_global", "purge_all"}:
-        try:
-            import asyncio
-            asyncio.run(_purge_global())
-        except RuntimeError:
-            discord.Client(intents=intents_min).close()
-    if RUN_MODE in {"purge_guild", "purge_all"}:
-        try:
-            import asyncio
-            asyncio.run(_purge_guilds(GUILD_IDS))
-        except RuntimeError:
-            discord.Client(intents=intents_min).close()
-    sys.exit(0)
-
-# ================== INTENTS / KLIENT ==================
 intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
 intents.guilds = True
-intents.members = True               # włącz w Dev Portal
-intents.message_content = True       # włącz w Dev Portal
 intents.reactions = True
+intents.emojis = True
 
 class MyClient(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.signup_message_id: Optional[int] = None
-        self._poll_task: Optional[asyncio.Task] = None
-        self._seen_message_ids: Set[int] = set()
-        self._last_poll_ts: datetime = datetime.now(timezone.utc) - timedelta(minutes=15)
+        self.pending: Dict[int, Set[int]] = {ROLE_PREMKA300:set(), ROLE_PREMKAZWK:set(), ROLE_PREMKAHORY:set()}
+        self.announced: Set[Tuple[int, int]] = set()
+        self.last_ping: Dict[int, datetime] = {}
+        self.pt_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self):
         try:
             self.tree.clear_commands(guild=None)
             await self.tree.sync()
-            log.info("Globalne komendy wyczyszczone.")
-        except Exception as e:
-            log.warning(f"Nie udało się wyczyścić globalnych: {e}")
-
+        except Exception:
+            pass
         if not GUILD_IDS:
             for cmd in ALL_CMDS:
-                try: self.tree.add_command(cmd)
-                except Exception as e: log.warning(f"add_command (global) {cmd.name}: {e}")
+                try:
+                    self.tree.add_command(cmd)
+                except Exception:
+                    pass
             await self.tree.sync()
-            log.info("Zsynchronizowano globalnie (brak GUILD_IDS).")
         else:
             for gid in GUILD_IDS:
                 gobj = discord.Object(id=gid)
                 for cmd in ALL_CMDS:
-                    try: self.tree.add_command(cmd, guild=gobj)
-                    except Exception as e: log.warning(f"add_command (guild={gid}) {cmd.name}: {e}")
-                synced = await self.tree.sync(guild=gobj)
-                log.info(f"Zsynchronizowano {len(synced)} komend dla gildii {gid}")
+                    try:
+                        self.tree.add_command(cmd, guild=gobj)
+                    except Exception:
+                        pass
                 try:
-                    existing = await self.tree.fetch_commands(guild=gobj)
-                    log.info(f"GUILD {gid} → {[c.name for c in existing]}")
-                except Exception as e:
-                    log.warning(f"fetch_commands({gid}) nieudane: {e}")
+                    await self.tree.sync(guild=gobj)
+                except Exception:
+                    pass
+                try:
+                    await self.tree.fetch_commands(guild=gobj)
+                except Exception:
+                    pass
 
-        await self._post_signup_message()
-        if self._poll_task is None:
-            self._poll_task = asyncio.create_task(self._poll_loop())
-        asyncio.create_task(self._post_signup_after_ready())
+    async def on_ready(self):
+        await self.change_presence(activity=None, status=discord.Status.online)
+        await load_hub_emoji(self)
+        await self.ensure_signup_message()
+        await self.sync_roles_from_reactions()
+        if self.pt_task is None:
+            self.pt_task = asyncio.create_task(self.primetime_loop())
+        log.info(f"Gotowy jako {self.user} ({self.user.id})")
 
-    async def _post_signup_after_ready(self):
-        await self.wait_until_ready()
-        await asyncio.sleep(2)
-        if not self.signup_message_id:
-            await self._post_signup_message()
-
-    def _perm_report(self, ch: discord.TextChannel, me: discord.Member) -> Dict[str, bool]:
-        p = ch.permissions_for(me)
-        return {
-            "view_channel": p.view_channel,
-            "send_messages": p.send_messages,
-            "read_message_history": p.read_message_history,
-            "add_reactions": p.add_reactions,
-            "manage_messages": p.manage_messages,
-            "mention_everyone/roles": p.mention_everyone,
-            "manage_roles (global)": me.guild_permissions.manage_roles,
-        }
-
-    async def _post_signup_message(self):
-        guild = self.get_guild(TARGET_GUILD_ID)
-        if not guild:
-            log.warning("[SIGNUP] Brak docelowej gildii albo bot nie jest na serwerze.")
-            return
-        ch = guild.get_channel(SIGNUP_CHANNEL_ID)
-        if not isinstance(ch, discord.TextChannel):
-            log.warning("[SIGNUP] Nie widzę kanału zapisów (zły ID? brak dostępu?).")
-            return
-
-        me = guild.get_member(self.user.id) if self.user else None
-        if not isinstance(me, discord.Member):
-            log.warning("[SIGNUP] Nie mogę pobrać siebie (Member).")
-            return
-
-        rep = self._perm_report(ch, me)
-        log.info(f"[SIGNUP] Perms w kanale {ch.id}: {rep}")
-
-        try:
-            async for m in ch.history(limit=50, oldest_first=False):
-                if m.author.id == self.user.id and SIGNUP_MARKER in (m.content or ""):
-                    self.signup_message_id = m.id
-                    log.info(f"[SIGNUP] Znalazłem istniejący panel: {m.id}")
-                    return
-        except Exception as e:
-            log.warning(f"[SIGNUP] Nie mogę czytać historii: {e}")
-
-        if not (rep["view_channel"] and rep["send_messages"] and rep["add_reactions"]):
-            log.warning("[SIGNUP] Brakuje uprawnień do utworzenia panelu.")
-            return
-
-        lines = [
-            SIGNUP_MARKER,
-            SIGNUP_INFO,
-            "",
-            f"{EMOJI_GL} 300% PrimeTime na głownym serwerze",
-            f"{EMOJI_OR} 200% PrimeTime na zewnętrzynych",
-            f"{EMOJI_BTH} 200% PrimeTime na horyzoncie",
-        ]
-        msg = await ch.send("\n".join(lines))
-        self.signup_message_id = msg.id
-        for e in (EMOJI_GL, EMOJI_OR, EMOJI_BTH):
-            try:
-                await msg.add_reaction(e)
-            except Exception as e:
-                log.warning(f"[SIGNUP] add_reaction {e}")
-
-    async def _poll_loop(self):
-        await self.wait_until_ready()
-        while not self.is_closed():
-            try:
-                now = datetime.now(timezone.utc)
-                minute = now.minute
-                if minute in CRON_MINUTES:
-                    log.info("[POLL] Cron tick — skanuję historię…")
-                    await self._poll_once()
-                    await asyncio.sleep(60)
-                else:
-                    await asyncio.sleep(5)
-            except Exception as e:
-                log.warning(f"[POLL] wyjątek: {e}")
-                await asyncio.sleep(10)
-
-    async def _poll_once(self):
-        guild = self.get_guild(TARGET_GUILD_ID)
+    async def ensure_signup_message(self):
+        guild = self.get_guild(MAIN_GUILD_ID)
         if not guild:
             return
-        ch = guild.get_channel(WATCH_CHANNEL_ID)
+        ch: Optional[discord.TextChannel] = guild.get_channel(SIGNUP_CHANNEL_ID)  # type: ignore
         if not isinstance(ch, discord.TextChannel):
+            try:
+                ch = await self.fetch_channel(SIGNUP_CHANNEL_ID)  # type: ignore
+            except Exception:
+                return
+        msg: Optional[discord.Message] = None
+        if SIGNUP_MESSAGE_ID_ENV:
+            try:
+                msg = await ch.fetch_message(SIGNUP_MESSAGE_ID_ENV)
+            except Exception:
+                msg = None
+        if msg is None:
+            try:
+                async for m in ch.history(limit=50):
+                    if m.author.id == self.user.id and SIGNUP_MARKER in (m.content or ""):
+                        msg = m
+                        break
+            except Exception:
+                msg = None
+        if msg is None:
+            try:
+                msg = await ch.send(SIGNUP_TEXT)
+            except Exception:
+                msg = None
+        if msg:
+            self.signup_message_id = msg.id
+            await self._ensure_reactions(msg)
+
+    async def sync_roles_from_reactions(self):
+        guild = self.get_guild(MAIN_GUILD_ID)
+        if not guild or not self.signup_message_id:
             return
-        cutoff = self._last_poll_ts
-        newest_ts = cutoff
-        try:
-            async for m in ch.history(limit=50, oldest_first=False, after=cutoff):
-                newest_ts = max(newest_ts, m.created_at or newest_ts)
-                if m.id in self._seen_message_ids:
-                    continue
-                await self._maybe_trigger_from_message(m)
-                self._seen_message_ids.add(m.id)
-        except Exception as e:
-            log.warning(f"[POLL] history error: {e}")
-        self._last_poll_ts = newest_ts or datetime.now(timezone.utc)
-
-    async def _maybe_trigger_from_message(self, m: discord.Message):
-        content = m.content or ""
-        author_ok = (m.author.id == TRIGGER_BOT_USER_ID) or bool(getattr(m.author, "bot", False))
-        if not author_ok:
-            log.info(f"[SCAN] pomijam (autor != trigger i nie bot): {m.author} ({m.author.id})")
-            return
-
-        txt = content.strip()
-        low = txt.lower()
-        matched = None
-        if PAT_300_MAIN.search(txt):
-            matched = ("300gl", ROLE_300GL_ID, "300% PrimeTime na głównym serwerze")
-        elif PAT_200_OR.search(txt):
-            matched = ("200or", ROLE_200OR_ID, "200% PrimeTime na zewnętrzynych")
-        elif PAT_200_BTH.search(txt):
-            matched = ("200bth", ROLE_200BTH_ID, "200% PrimeTime na horyzoncie")
-
-        log.info(f"[SCAN] msg {m.id} od {m.author} ({m.author.id}) match={bool(matched)}: {txt[:120]}")
-
-        if matched:
-            kind, role_id, label = matched
-            await self._fire_ping_and_cleanup(kind=kind, role_id=role_id, label=label)
-
-    async def _fire_ping_and_cleanup(self, kind: str, role_id: int, label: str):
-        guild = self.get_guild(TARGET_GUILD_ID)
-        if not guild:
-            return
-        ch = guild.get_channel(WATCH_CHANNEL_ID)
+        ch: Optional[discord.TextChannel] = guild.get_channel(SIGNUP_CHANNEL_ID)  # type: ignore
         if not isinstance(ch, discord.TextChannel):
-            return
-        role = guild.get_role(role_id)
-        if not role:
-            log.warning(f"[PING] Brak roli {role_id}")
-            return
-
-        members_with_role = list(role.members)  # szybciej i pewniej niż pełne przeszukiwanie cache
-        log.info(f"[PING] {label} — zapisanych: {len(members_with_role)}")
-        if not members_with_role:
-            return
-
-        mention_line = role.mention
-        can_edit_mentionable = guild.me.guild_permissions.manage_roles and role.position < guild.me.top_role.position
-        changed_flag = False
+            try:
+                ch = await self.fetch_channel(SIGNUP_CHANNEL_ID)  # type: ignore
+            except Exception:
+                return
         try:
-            if not role.mentionable and can_edit_mentionable:
-                await role.edit(mentionable=True, reason="Tymczasowo, by pingnąć zapisanych")
-                changed_flag = True
-        except Exception as e:
-            log.warning(f"[PING] Nie mogę ustawić mentionable dla roli {role.id}: {e}")
-
-        try:
-            await ch.send(f"{mention_line} — {label} wystartował!")
-        except Exception as e:
-            log.warning(f"[PING] Nie mogę wysłać pingu: {e}")
-
-        if changed_flag:
-            try:
-                await role.edit(mentionable=False, reason="Przywrócenie poprzedniego stanu")
-            except Exception as e:
-                log.warning(f"[PING] Nie mogę cofnąć mentionable: {e}")
-
-        for m in members_with_role:
-            try:
-                await m.remove_roles(role, reason="Jednorazowy ping wykorzystany")
-            except Exception as e:
-                log.warning(f"[CLEANUP] remove_roles({m.id}): {e}")
-
-        if self.signup_message_id:
-            try:
-                signup_ch = guild.get_channel(SIGNUP_CHANNEL_ID)
-                if isinstance(signup_ch, discord.TextChannel):
-                    msg = await signup_ch.fetch_message(self.signup_message_id)
-                    target_emoji = EMOJI_GL if kind=="300gl" else EMOJI_OR if kind=="200or" else EMOJI_BTH
-                    for m in members_with_role:
+            for role_id in [ROLE_PREMKA300, ROLE_PREMKAZWK, ROLE_PREMKAHORY]:
+                role = guild.get_role(role_id)
+                if role:
+                    members = list(role.members)
+                    for m in members:
                         try:
-                            await msg.remove_reaction(target_emoji, m)
+                            await m.remove_roles(role, reason="PrimeTime reset przy starcie")
                         except Exception:
                             pass
-            except Exception as e:
-                log.warning(f"[CLEANUP] remove_reaction: {e}")
+                    self.pending[role_id].clear()
+            msg = await ch.fetch_message(self.signup_message_id)
+            for reaction in msg.reactions:
+                emoji_str = str(reaction.emoji)
+                role_id = EMOJI_TO_ROLE.get(emoji_str)
+                if not role_id:
+                    continue
+                try:
+                    async for user in reaction.users(limit=None):
+                        if user.bot:
+                            continue
+                        try:
+                            member = guild.get_member(user.id) or await guild.fetch_member(user.id)
+                            role = guild.get_role(role_id)
+                            if role:
+                                await member.add_roles(role, reason="PrimeTime sync po starcie")
+                                self.pending.setdefault(role_id, set()).add(member.id)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    async def on_message(self, message: discord.Message):
-        if not isinstance(message.channel, discord.TextChannel):
+    async def _ensure_reactions(self, msg: discord.Message):
+        order = [EMOJI_300GL, EMOJI_200OR, EMOJI_200BTH]
+        have = set(str(r.emoji) for r in msg.reactions)
+        for em in order:
+            if em not in have:
+                try:
+                    await msg.add_reaction(em)
+                except Exception:
+                    pass
+
+    def _role_for_emoji(self, emoji_str: str) -> Optional[int]:
+        return EMOJI_TO_ROLE.get(emoji_str)
+
+    async def _add_pending_role(self, guild: discord.Guild, user_id: int, role_id: int):
+        role = guild.get_role(role_id)
+        if not role:
             return
-        if message.guild and message.guild.id == TARGET_GUILD_ID and message.channel.id == WATCH_CHANNEL_ID:
-            if message.id in self._seen_message_ids:
-                return
-            await self._maybe_trigger_from_message(message)
-            self._seen_message_ids.add(message.id)
+        try:
+            member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+            await member.add_roles(role, reason="PrimeTime signup (one-shot)")
+            self.pending.setdefault(role_id, set()).add(user_id)
+        except Exception:
+            pass
+
+    async def _remove_pending_role_and_reaction(self, guild: discord.Guild, user_id: int, role_id: int):
+        role = guild.get_role(role_id)
+        if role:
+            try:
+                member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+                if role in member.roles:
+                    await member.remove_roles(role, reason="PrimeTime one-shot zakończony")
+            except Exception:
+                pass
+        if self.signup_message_id:
+            try:
+                ch = guild.get_channel(SIGNUP_CHANNEL_ID) or await self.fetch_channel(SIGNUP_CHANNEL_ID)  # type: ignore
+                if isinstance(ch, discord.TextChannel):
+                    msg = await ch.fetch_message(self.signup_message_id)
+                    emoji = next((e for e,r in EMOJI_TO_ROLE.items() if r==role_id), None)
+                    if emoji:
+                        try:
+                            member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+                            await msg.remove_reaction(emoji, member)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
-        if payload.guild_id != TARGET_GUILD_ID:
+        if payload.guild_id != MAIN_GUILD_ID:
             return
-        if payload.channel_id != SIGNUP_CHANNEL_ID:
+        if self.signup_message_id is None or payload.message_id != self.signup_message_id:
             return
         if payload.user_id == self.user.id:
             return
+        emoji_str = str(payload.emoji)
+        role_id = self._role_for_emoji(emoji_str)
+        if not role_id:
+            return
         guild = self.get_guild(payload.guild_id)
         if not guild:
             return
-        member = guild.get_member(payload.user_id)
-        if not member:
-            return
-        if self.signup_message_id and payload.message_id != self.signup_message_id:
-            return
-
-        emoji_str = str(payload.emoji)
-        role: Optional[discord.Role] = None
-        if emoji_str == EMOJI_GL:
-            role = guild.get_role(ROLE_300GL_ID)
-        elif emoji_str == EMOJI_OR:
-            role = guild.get_role(ROLE_200OR_ID)
-        elif emoji_str == EMOJI_BTH:
-            role = guild.get_role(ROLE_200BTH_ID)
-
-        if role is None:
-            return
-        try:
-            await member.add_roles(role, reason="Zapisy na 1x ping PrimeTime")
-        except Exception as e:
-            log.warning(f"[REACTION_ADD] add_roles: {e}")
+        await self._add_pending_role(guild, payload.user_id, role_id)
 
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
-        if payload.guild_id != TARGET_GUILD_ID:
+        if payload.guild_id != MAIN_GUILD_ID:
             return
-        if payload.channel_id != SIGNUP_CHANNEL_ID:
+        if self.signup_message_id is None or payload.message_id != self.signup_message_id:
             return
-        if self.signup_message_id and payload.message_id != self.signup_message_id:
+        emoji_str = str(payload.emoji)
+        role_id = self._role_for_emoji(emoji_str)
+        if not role_id:
             return
-
         guild = self.get_guild(payload.guild_id)
         if not guild:
             return
-        member = guild.get_member(payload.user_id)
-        if not member:
-            return
-
-        emoji_str = str(payload.emoji)
-        role: Optional[discord.Role] = None
-        if emoji_str == EMOJI_GL:
-            role = guild.get_role(ROLE_300GL_ID)
-        elif emoji_str == EMOJI_OR:
-            role = guild.get_role(ROLE_200OR_ID)
-        elif emoji_str == EMOJI_BTH:
-            role = guild.get_role(ROLE_200BTH_ID)
-        if role is None:
-            return
         try:
-            await member.remove_roles(role, reason="Wypis z pingu PrimeTime")
-        except Exception as e:
-            log.warning(f"[REACTION_REMOVE] remove_roles: {e}")
+            member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+            role = guild.get_role(role_id)
+            if role and role in member.roles:
+                await member.remove_roles(role, reason="PrimeTime: usunięcie reakcji")
+        except Exception:
+            pass
+        self.pending.get(role_id, set()).discard(payload.user_id)
 
-client = MyClient()
-tree = client.tree
+    async def primetime_loop(self):
+        while not self.is_closed():
+            now = datetime.now(timezone.utc)
+            next_tick = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+            await asyncio.sleep(max(1.0, (next_tick - now).total_seconds()))
+            try:
+                await self.scan_and_ping()
+            except Exception:
+                pass
 
-# ================== UTYLITKI (pozostałe komendy) ==================
+    async def scan_and_ping(self):
+        guild = self.get_guild(MAIN_GUILD_ID)
+        if not guild:
+            return
+        ch = guild.get_channel(EM_CHANNEL_ID)
+        if not isinstance(ch, discord.TextChannel):
+            try:
+                ch = await self.fetch_channel(EM_CHANNEL_ID)  # type: ignore
+            except Exception:
+                return
+        if not isinstance(ch, discord.TextChannel):
+            return
+        matched: List[Tuple[int, discord.Message]] = []
+        try:
+            async for msg in ch.history(limit=5, oldest_first=False):
+                if msg.author.id not in ALLOWED_EM_AUTHOR_IDS:
+                    continue
+                c = (msg.content or "")
+                if any(s in c for s in MATCH_300GL):
+                    matched.append((ROLE_PREMKA300, msg))
+                elif any(s in c for s in MATCH_200OR):
+                    matched.append((ROLE_PREMKAZWK, msg))
+                elif any(s in c for s in MATCH_200BTH):
+                    matched.append((ROLE_PREMKAHORY, msg))
+        except Exception:
+            return
+        by_role_latest: Dict[int, discord.Message] = {}
+        for role_id, m in matched:
+            prev = by_role_latest.get(role_id)
+            if prev is None or m.created_at > prev.created_at:
+                by_role_latest[role_id] = m
+        now = datetime.now(timezone.utc)
+        cooldown = timedelta(minutes=30)
+        for role_id, msg in by_role_latest.items():
+            if (last := self.last_ping.get(role_id)) and (now - last) < cooldown:
+                continue
+            key = (role_id, msg.id)
+            if key in self.announced:
+                continue
+            try:
+                mention = f"<@&{role_id}>"
+                await ch.send(f"{mention} — {msg.content.strip()}")
+                self.announced.add(key)
+                self.last_ping[role_id] = now
+                users = list(self.pending.get(role_id, set()))
+                for uid in users:
+                    try:
+                        await self._remove_pending_role_and_reaction(guild, uid, role_id)
+                    except Exception:
+                        pass
+                self.pending[role_id].clear()
+            except Exception:
+                pass
+
 def fmt_int(x): return f"{int(round(float(x))):,}".replace(","," ")
 def _to_int(s):
     try:
@@ -440,6 +369,7 @@ def _sev_emoji(days:int)->str:
     elif days <= 9: return "🟠"
     else: return "🟢"
 
+HUB_ID = int(os.getenv("EMOJI_HUB_ID") or 0)
 HUB_EMOJI_ID: Dict[str,int] = {}
 HUB_NAMES = {
  "patronat":["Patronat","patronat"],
@@ -464,15 +394,15 @@ UNI={"charter":"💠","construction":"🧱","sceat":"🪙","upgrade":"🛠️","
 MEDAL_UNI={"gold":"🥇","silver":"🥈","bronze":"🥉","glass":"🪟","copper":"🟠","stone":"🪨","wood":"🪵"}
 MEDAL_ALIAS={"gold":"zloty_medal","silver":"srebrny_medal","bronze":"brazowy_medal","glass":"szklany_medal","copper":"miedziany_medal","stone":"kamienny_medal","wood":"drewniany_medal"}
 
-async def load_hub_emoji():
+async def load_hub_emoji(client: discord.Client):
     if not HUB_ID: return
     try:
         g = client.get_guild(HUB_ID) or await client.fetch_guild(HUB_ID)
         emojis = await g.fetch_emojis()
         for e in emojis:
             HUB_EMOJI_ID[e.name] = e.id
-    except Exception as e:
-        log.warning(f"Nie udało się wczytać emoji z HUB_ID={HUB_ID}: {e}")
+    except Exception:
+        pass
 
 def _app(name: str) -> Optional[str]:
     eid = HUB_EMOJI_ID.get(name)
@@ -555,53 +485,6 @@ def best_ruby_cost_for_charters(req:int)->Tuple[int,str,float]:
     avg= total/req if req>0 else 0.0
     return int(round(total)), plan, avg
 
-def parse_yn_optional(val: str) -> Optional[bool]:
-    s = str(val or "").strip().lower()
-    if s == "": return None
-    if s in ("y","yes","tak","1"): return True
-    if s in ("n","no","nie","0"): return False
-    return None
-
-def days_until_below(current: int, threshold: int, daily_loss_pct: float) -> int:
-    c = float(max(0, int(current)))
-    t = float(max(0, int(threshold)))
-    r = max(0.0, min(100.0, float(daily_loss_pct))) / 100.0
-    if c < t:  return 0
-    if c == t: return 1
-    if r <= 0.0: return 10**9
-    n = math.log(t/c) / math.log(1.0 - r)
-    return max(0, math.ceil(n))
-
-def _beri_rate_and_boundary(cur: float) -> Tuple[float, int]:
-    if cur < 45_000:
-        return 3.0, 0
-    elif cur < 95_000:
-        return 4.0, 45_000
-    elif cur < 145_000:
-        return 5.0, 95_000
-    else:
-        return 7.0, 145_000
-
-def days_until_below_berimond(current: int, threshold: int) -> int:
-    c = float(max(0, int(current)))
-    t = float(max(0, int(threshold)))
-    if c < t: return 0
-    if c == t: return 1
-    days = 0
-    while c > t:
-        rate, boundary = _beri_rate_and_boundary(c)
-        r = rate / 100.0
-        target_in_seg = max(t, float(boundary))
-        if c <= target_in_seg:
-            break
-        n = days_until_below(int(c), int(target_in_seg), rate)
-        if n <= 0: n = 1
-        days += n
-        c = c * ((1.0 - r) ** n)
-        if days > 10000: break
-    return days
-
-# ================== PANEL DEKORACJI / LIGA / ZBIERACZ / TYTUŁ ==================
 SESS:Dict[int,dict]={}
 def _new_s(): return {"charter":0,"construction":0,"sceat":0,"upgrade":0,"samurai_medals":0,"samurai_tokens":0,"khan_medals":0,"khan_tablets":0,"current_level":0,"current_progress":0,"target_level":0}
 def _s(uid:int)->dict:
@@ -651,69 +534,6 @@ def _embed(guild, s, show=False):
             emb.add_field(name="🎯 Cel już osiągnięty",value=f"Masz co najmniej poziom **{target}**.",inline=False)
     return emb
 
-class SpendingModal1(discord.ui.Modal, title="Wydatki — 1/2"):
-    def __init__(self, s): super().__init__(custom_id="patronat:m1"); self.s=s
-    charter=discord.ui.TextInput(label="Żetony patronatu",required=False)
-    sceat=discord.ui.TextInput(label="Groszaki",required=False)
-    construction=discord.ui.TextInput(label="Żetony budowy",required=False)
-    upgrade=discord.ui.TextInput(label="Żetony ulepszenia",required=False)
-    async def on_submit(self,i):
-        try:
-            self.s["charter"]=_to_int(self.charter.value); self.s["sceat"]=_to_int(self.sceat.value)
-            self.s["construction"]=_to_int(self.construction.value); self.s["upgrade"]=_to_int(self.upgrade.value)
-            await i.response.send_message("Zapisano (1/2). Kliknij **Zapisz**.",ephemeral=True)
-        except:
-            await i.response.send_message("Błąd (1/2).",ephemeral=True)
-
-class SpendingModal2(discord.ui.Modal, title="Wydatki — 2/2"):
-    def __init__(self, s): super().__init__(custom_id="patronat:m2"); self.s=s
-    samurai_medals=discord.ui.TextInput(label="Medale Samuraja",required=False)
-    samurai_tokens=discord.ui.TextInput(label="Żetony Samuraja",required=False)
-    khan_medals=discord.ui.TextInput(label="Medale Chana",required=False)
-    khan_tablets=discord.ui.TextInput(label="Tabliczki Nomada",required=False)
-    async def on_submit(self,i):
-        try:
-            self.s["samurai_medals"]=_to_int(self.samurai_medals.value)
-            self.s["samurai_tokens"]=_to_int(self.samurai_tokens.value)
-            self.s["khan_medals"]=_to_int(self.khan_medals.value)
-            self.s["khan_tablets"]=_to_int(self.khan_tablets.value)
-            await i.response.send_message("Zapisano (2/2). Kliknij **Zapisz**.",ephemeral=True)
-        except:
-            await i.response.send_message("Błąd (2/2).",ephemeral=True)
-
-class StateModal(discord.ui.Modal, title="LVL dekoracji"):
-    def __init__(self,s): super().__init__(custom_id="patronat:state"); self.s=s
-    level=discord.ui.TextInput(label="Obecny poziom (0–10)",required=False,max_length=2)
-    progress=discord.ui.TextInput(label="Punkty wbite w poziom",required=False)
-    target=discord.ui.TextInput(label="Docelowy poziom (1–10)",required=False,max_length=2)
-    async def on_submit(self,i):
-        try:
-            self.s["current_level"]=max(0,min(10,_to_int(self.level.value or 0)))
-            self.s["current_progress"]=max(0,_to_int(self.progress.value or 0))
-            self.s["target_level"]=max(0,min(10,_to_int(self.target.value or 0)))
-            await i.response.send_message("Parametry zapisane. Kliknij **Zapisz**.",ephemeral=True)
-        except:
-            await i.response.send_message("Błąd.",ephemeral=True)
-
-class DekorView(discord.ui.View):
-    def __init__(self,uid): super().__init__(timeout=600); self.uid=uid
-    async def interaction_check(self,i):
-        if i.user.id!=self.uid:
-            await i.response.send_message("To prywatny panel innego użytkownika.",ephemeral=True)
-            return False
-        return True
-    @discord.ui.button(label="1",style=discord.ButtonStyle.primary,emoji="🧾")
-    async def b1(self,i,_): await i.response.send_modal(SpendingModal1(_s(self.uid)))
-    @discord.ui.button(label="2",style=discord.ButtonStyle.primary,emoji="💰")
-    async def b2(self,i,_): await i.response.send_modal(SpendingModal2(_s(self.uid)))
-    @discord.ui.button(label="LVL dekoracji",style=discord.ButtonStyle.secondary,emoji="🧭")
-    async def b3(self,i,_): await i.response.send_modal(StateModal(_s(self.uid)))
-    @discord.ui.button(label="Zapisz",style=discord.ButtonStyle.success,emoji="🔄")
-    async def b4(self,i,_): await i.response.edit_message(embed=_embed(i.guild,_s(self.uid),True),view=self)
-    @discord.ui.button(label="Wyczyść",style=discord.ButtonStyle.danger,emoji="🧹")
-    async def b5(self,i,_): SESS[self.uid]=_new_s(); await i.response.edit_message(embed=_embed(i.guild,_s(self.uid),False),view=self)
-
-# ================== KOMENDY ==================
 @app_commands.command(name="pomoc",description="Lista komend")
 async def pomoc(i:discord.Interaction):
     d=(
@@ -827,9 +647,51 @@ class LigaView(discord.ui.View):
 async def liga_cmd(i:discord.Interaction):
     await i.response.send_message(embed=_liga_embed(i.guild,_l(i.user.id)),view=LigaView(i.user.id),ephemeral=True)
 
-def required_today(current:int,days_left:int,target:int,mult:float=1.35)->int:
-    days_left=max(0,int(days_left)); current=max(0,int(current)); target=max(0,int(target))
-    need_base= target/(mult**days_left); return max(0, math.ceil(need_base-current))
+def parse_yn_optional(val: str) -> Optional[bool]:
+    s = str(val or "").strip().lower()
+    if s == "": return None
+    if s in ("y","yes","tak","1"): return True
+    if s in ("n","no","nie","0"): return False
+    return None
+
+def days_until_below(current: int, threshold: int, daily_loss_pct: float) -> int:
+    c = float(max(0, int(current)))
+    t = float(max(0, int(threshold)))
+    r = max(0.0, min(100.0, float(daily_loss_pct))) / 100.0
+    if c < t:  return 0
+    if c == t: return 1
+    if r <= 0.0: return 10**9
+    n = math.log(t/c) / math.log(1.0 - r)
+    return max(0, math.ceil(n))
+
+def _beri_rate_and_boundary(cur: float) -> Tuple[float, int]:
+    if cur < 45_000:
+        return 3.0, 0
+    elif cur < 95_000:
+        return 4.0, 45_000
+    elif cur < 145_000:
+        return 5.0, 95_000
+    else:
+        return 7.0, 145_000
+
+def days_until_below_berimond(current: int, threshold: int) -> int:
+    c = float(max(0, int(current)))
+    t = float(max(0, int(threshold)))
+    if c < t: return 0
+    if c == t: return 1
+    days = 0
+    while c > t:
+        rate, boundary = _beri_rate_and_boundary(c)
+        r = rate / 100.0
+        target_in_seg = max(t, float(boundary))
+        if c <= target_in_seg:
+            break
+        n = days_until_below(int(c), int(target_in_seg), rate)
+        if n <= 0: n = 1
+        days += n
+        c = c * ((1.0 - r) ** n)
+        if days > 10000: break
+    return days
 
 class ZbieraczModal(discord.ui.Modal, title="Zbieracz — kalkulator"):
     def __init__(self): super().__init__(custom_id="zbieracz:m")
@@ -848,6 +710,10 @@ class ZbieraczModal(discord.ui.Modal, title="Zbieracz — kalkulator"):
             await i.response.send_message(embed=e,ephemeral=True)
         except:
             await i.response.send_message("Błąd podczas obliczeń.",ephemeral=True)
+
+def required_today(current:int,days_left:int,target:int,mult:float=1.35)->int:
+    days_left=max(0,int(days_left)); current=max(0,int(current)); target=max(0,int(target))
+    need_base= target/(mult**days_left); return max(0, math.ceil(need_base-current))
 
 @app_commands.command(name="zbieracz",description="ile musisz zdobyć punktów, by spełnić swój cel")
 async def zbieracz_cmd(i:discord.Interaction):
@@ -911,35 +777,71 @@ async def tytul_cmd(i: discord.Interaction):
                 await inter.response.send_message("Błąd obliczeń.", ephemeral=True)
     await i.response.send_modal(TytulModal())
 
-# >>> Diagnostyka: wymuś panel + sprawdź perms
-@app_commands.command(name="ptsetup", description="[ADMIN] Wymuś panel PrimeTime i pokaż uprawnienia")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def ptsetup_cmd(i: discord.Interaction):
-    if not i.guild or i.guild.id != TARGET_GUILD_ID:
-        return await i.response.send_message("Ta komenda działa tylko na głównym serwerze.", ephemeral=True)
-    await client._post_signup_message()
-    g = i.guild
-    ch = g.get_channel(SIGNUP_CHANNEL_ID)
-    me = g.get_member(client.user.id) if client.user else None
-    rep = client._perm_report(ch, me) if isinstance(ch, discord.TextChannel) and isinstance(me, discord.Member) else {}
-    await i.response.send_message(
-        f"OK. signup_message_id={client.signup_message_id}\nPerms: {rep}",
-        ephemeral=True
-    )
+ALL_CMDS=[pomoc, patronat_cmd, liga_cmd, tytul_cmd, zbieracz_cmd]
 
-ALL_CMDS=[pomoc, patronat_cmd, liga_cmd, tytul_cmd, zbieracz_cmd, ptsetup_cmd]
+class SpendingModal1(discord.ui.Modal, title="Wydatki — 1/2"):
+    def __init__(self, s): super().__init__(custom_id="patronat:m1"); self.s=s
+    charter=discord.ui.TextInput(label="Żetony patronatu",required=False)
+    sceat=discord.ui.TextInput(label="Groszaki",required=False)
+    construction=discord.ui.TextInput(label="Żetony budowy",required=False)
+    upgrade=discord.ui.TextInput(label="Żetony ulepszenia",required=False)
+    async def on_submit(self,i):
+        try:
+            self.s["charter"]=_to_int(self.charter.value); self.s["sceat"]=_to_int(self.sceat.value)
+            self.s["construction"]=_to_int(self.construction.value); self.s["upgrade"]=_to_int(self.upgrade.value)
+            await i.response.send_message("Zapisano (1/2). Kliknij **Zapisz**.",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd (1/2).",ephemeral=True)
 
-# ================== LIFECYCLE ==================
-@client.event
-async def on_ready():
-    await client.change_presence(activity=None, status=discord.Status.online)
-    await load_hub_emoji()
-    log.info(f"Wczytano emoji z huba: {len(HUB_EMOJI_ID)}")
-    gl = await client.tree.fetch_commands()
-    log.info(f"GLOBAL → {[c.name for c in gl]}")
-    for gid in GUILD_IDS:
-        cmds = await client.tree.fetch_commands(guild=discord.Object(id=gid))
-        log.info(f"GUILD {gid} → {[c.name for c in cmds]}")
+class SpendingModal2(discord.ui.Modal, title="Wydatki — 2/2"):
+    def __init__(self, s): super().__init__(custom_id="patronat:m2"); self.s=s
+    samurai_medals=discord.ui.TextInput(label="Medale Samuraja",required=False)
+    samurai_tokens=discord.ui.TextInput(label="Żetony Samuraja",required=False)
+    khan_medals=discord.ui.TextInput(label="Medale Chana",required=False)
+    khan_tablets=discord.ui.TextInput(label="Tabliczki Nomada",required=False)
+    async def on_submit(self,i):
+        try:
+            self.s["samurai_medals"]=_to_int(self.samurai_medals.value)
+            self.s["samurai_tokens"]=_to_int(self.samurai_tokens.value)
+            self.s["khan_medals"]=_to_int(self.khan_medals.value)
+            self.s["khan_tablets"]=_to_int(self.khan_tablets.value)
+            await i.response.send_message("Zapisano (2/2). Kliknij **Zapisz**.",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd (2/2).",ephemeral=True)
 
-# ================== START ==================
-client.run(TOKEN)
+class StateModal(discord.ui.Modal, title="LVL dekoracji"):
+    def __init__(self,s): super().__init__(custom_id="patronat:state"); self.s=s
+    level=discord.ui.TextInput(label="Obecny poziom (0–10)",required=False,max_length=2)
+    progress=discord.ui.TextInput(label="Punkty wbite w poziom",required=False)
+    target=discord.ui.TextInput(label="Docelowy poziom (1–10)",required=False,max_length=2)
+    async def on_submit(self,i):
+        try:
+            self.s["current_level"]=max(0,min(10,_to_int(self.level.value or 0)))
+            self.s["current_progress"]=max(0,_to_int(self.progress.value or 0))
+            self.s["target_level"]=max(0,min(10,_to_int(self.target.value or 0)))
+            await i.response.send_message("Parametry zapisane. Kliknij **Zapisz**.",ephemeral=True)
+        except:
+            await i.response.send_message("Błąd.",ephemeral=True)
+
+class DekorView(discord.ui.View):
+    def __init__(self,uid): super().__init__(timeout=600); self.uid=uid
+    async def interaction_check(self,i):
+        if i.user.id!=self.uid:
+            await i.response.send_message("To prywatny panel innego użytkownika.",ephemeral=True)
+            return False
+        return True
+    @discord.ui.button(label="1",style=discord.ButtonStyle.primary,emoji="🧾")
+    async def b1(self,i,_): await i.response.send_modal(SpendingModal1(_s(self.uid)))
+    @discord.ui.button(label="2",style=discord.ButtonStyle.primary,emoji="💰")
+    async def b2(self,i,_): await i.response.send_modal(SpendingModal2(_s(self.uid)))
+    @discord.ui.button(label="LVL dekoracji",style=discord.ButtonStyle.secondary,emoji="🧭")
+    async def b3(self,i,_): await i.response.send_modal(StateModal(_s(self.uid)))
+    @discord.ui.button(label="Zapisz",style=discord.ButtonStyle.success,emoji="🔄")
+    async def b4(self,i,_): await i.response.edit_message(embed=_embed(i.guild,_s(self.uid),True),view=self)
+    @discord.ui.button(label="Wyczyść",style=discord.ButtonStyle.danger,emoji="🧹")
+    async def b5(self,i,_): SESS[self.uid]=_new_s(); await i.response.edit_message(embed=_embed(i.guild,_s(self.uid),False),view=self)
+
+client = MyClient()
+
+if __name__ == "__main__":
+    client.run(TOKEN)
