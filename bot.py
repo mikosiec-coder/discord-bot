@@ -37,7 +37,8 @@ MAIN_GUILD_ID = 1016796563227541574
 EM_CHANNEL_ID = 1414146583666364447
 SIGNUP_CHANNEL_ID = 1415624731293646891
 SIGNUP_MESSAGE_ID_ENV = int(os.getenv("SIGNUP_MESSAGE_ID") or 0)
-ALLOWED_EM_AUTHOR_IDS = {1414146769436147783, 353121781630107658}
+
+SELF_BOT_ID = 1413952299989995720
 
 ROLE_PREMKA300 = 1415630918529454081
 ROLE_PREMKAZWK = 1415631072246628433
@@ -62,7 +63,7 @@ SIGNUP_TEXT = (
     f"{EMOJI_300GL} — **300% PrimeTime na głównym serwerze**\n"
     f"{EMOJI_200OR} — **200% PrimeTime na zewnętrznych**\n"
     f"{EMOJI_200BTH} — **200% PrimeTime na horyzoncie**\n"
-    f"\nZostaniesz poinformowany o premce TYLKO 1 raz, przy najbliższej możliwej okazji."
+    f"\nPo pingnięciu przy najbliższym wydarzeniu rola i Twoja reakcja zostaną zdjęte (one-shot)."
 )
 
 EMOJI_TO_ROLE = {
@@ -90,6 +91,7 @@ class MyClient(discord.Client):
         self.announced: Set[Tuple[int, int]] = set()
         self.last_ping: Dict[int, datetime] = {}
         self.pt_task: Optional[asyncio.Task] = None
+        self.start_time: datetime = datetime.now(timezone.utc)
 
     async def setup_hook(self):
         try:
@@ -177,8 +179,7 @@ class MyClient(discord.Client):
             for role_id in [ROLE_PREMKA300, ROLE_PREMKAZWK, ROLE_PREMKAHORY]:
                 role = guild.get_role(role_id)
                 if role:
-                    members = list(role.members)
-                    for m in members:
+                    for m in list(role.members):
                         try:
                             await m.remove_roles(role, reason="PrimeTime reset przy starcie")
                         except Exception:
@@ -302,6 +303,19 @@ class MyClient(discord.Client):
             except Exception:
                 pass
 
+    async def _find_recent_self_ping(self, ch: discord.TextChannel, role_id: int, within_minutes: int) -> Optional[datetime]:
+        since = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
+        mention = f"<@&{role_id}>"
+        try:
+            async for m in ch.history(after=since, limit=200, oldest_first=False):
+                if not m.author:
+                    continue
+                if m.author.id in {SELF_BOT_ID, (self.user.id if self.user else 0)} and mention in (m.content or ""):
+                    return m.created_at if m.created_at.tzinfo else m.created_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+        return None
+
     async def scan_and_ping(self):
         guild = self.get_guild(MAIN_GUILD_ID)
         if not guild:
@@ -314,10 +328,16 @@ class MyClient(discord.Client):
                 return
         if not isinstance(ch, discord.TextChannel):
             return
+
+        now = datetime.now(timezone.utc)
+        within_catchup = (now - self.start_time) < timedelta(minutes=30)
+        lookback_minutes = 30 if within_catchup else 12
+        since = now - timedelta(minutes=lookback_minutes)
+
         matched: List[Tuple[int, discord.Message]] = []
         try:
-            async for msg in ch.history(limit=5, oldest_first=False):
-                if msg.author.id not in ALLOWED_EM_AUTHOR_IDS:
+            async for msg in ch.history(after=since, limit=200, oldest_first=False):
+                if msg.author and (msg.author.id == SELF_BOT_ID or msg.author.id == (self.user.id if self.user else 0)):
                     continue
                 c = (msg.content or "")
                 if any(s in c for s in MATCH_300GL):
@@ -328,19 +348,29 @@ class MyClient(discord.Client):
                     matched.append((ROLE_PREMKAHORY, msg))
         except Exception:
             return
+
         by_role_latest: Dict[int, discord.Message] = {}
         for role_id, m in matched:
             prev = by_role_latest.get(role_id)
             if prev is None or m.created_at > prev.created_at:
                 by_role_latest[role_id] = m
-        now = datetime.now(timezone.utc)
+
         cooldown = timedelta(minutes=30)
+
         for role_id, msg in by_role_latest.items():
             if (last := self.last_ping.get(role_id)) and (now - last) < cooldown:
                 continue
+
+            if role_id not in self.last_ping and within_catchup:
+                prev_ts = await self._find_recent_self_ping(ch, role_id, within_minutes=30)
+                if prev_ts:
+                    self.last_ping[role_id] = prev_ts
+                    continue
+
             key = (role_id, msg.id)
             if key in self.announced:
                 continue
+
             try:
                 mention = f"<@&{role_id}>"
                 await ch.send(f"{mention} — {msg.content.strip()}")
@@ -498,7 +528,9 @@ def _spent_lines(s):
         v=s.get(k,0)
         if v and int(v)>0:
             parts.append(f"{E(k)} **{PL_NAME[k]}:** {fmt_int(v)}")
-    return "\n".join(parts) if parts else "—"
+    return "\n".join(parts) if parts else "—
+
+"
 
 def _embed(guild, s, show=False):
     gained=calc_points(charter=s["charter"],construction=s["construction"],sceat=s["sceat"],upgrade=s["upgrade"],samurai_medals=s["samurai_medals"],samurai_tokens=s["samurai_tokens"],khan_medals=s["khan_medals"],khan_tablets=s["khan_tablets"])
