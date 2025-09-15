@@ -302,6 +302,25 @@ class MyClient(discord.Client):
             except Exception:
                 pass
 
+    def _msg_text(self, msg: discord.Message) -> str:
+        parts: List[str] = []
+        if msg.content:
+            parts.append(msg.content)
+        for e in msg.embeds or []:
+            try:
+                if e.title: parts.append(e.title)
+                if e.description: parts.append(e.description)
+                for f in (e.fields or []):
+                    if f.name: parts.append(f.name)
+                    if f.value: parts.append(f.value)
+                if e.footer and getattr(e.footer, "text", None):
+                    parts.append(e.footer.text)
+                if e.author and getattr(e.author, "name", None):
+                    parts.append(e.author.name)
+            except Exception:
+                continue
+        return "\n".join(parts)
+
     async def _find_recent_self_ping(self, ch: discord.TextChannel, role_id: int, within_minutes: int) -> Optional[datetime]:
         since = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
         mention = f"<@&{role_id}>"
@@ -338,7 +357,9 @@ class MyClient(discord.Client):
             async for msg in ch.history(after=since, limit=200, oldest_first=False):
                 if msg.author and (msg.author.id == SELF_BOT_ID or msg.author.id == (self.user.id if self.user else 0)):
                     continue
-                c = (msg.content or "")
+                c = self._msg_text(msg)
+                if not c:
+                    continue
                 if any(s in c for s in MATCH_300GL):
                     matched.append((ROLE_PREMKA300, msg))
                 elif any(s in c for s in MATCH_200OR):
@@ -372,7 +393,7 @@ class MyClient(discord.Client):
 
             try:
                 mention = f"<@&{role_id}>"
-                await ch.send(f"{mention} — {msg.content.strip()}")
+                await ch.send(f"{mention} — {self._msg_text(msg).strip() or 'Prime Time'}")
                 self.announced.add(key)
                 self.last_ping[role_id] = now
                 users = list(self.pending.get(role_id, set()))
