@@ -62,7 +62,7 @@ SIGNUP_TEXT = (
     f"{EMOJI_300GL} — **300% PrimeTime na głównym serwerze**\n"
     f"{EMOJI_200OR} — **200% PrimeTime na zewnętrznych**\n"
     f"{EMOJI_200BTH} — **200% PrimeTime na horyzoncie**\n"
-    f"\nPo pingnięciu przy najbliższym wydarzeniu rola i Twoja reakcja zostaną zdjęte (one-shot)."
+    f"\nZostaniesz poinformowany o premce TYLKO 1 raz, przy najbliższej możliwej okazji."
 )
 
 EMOJI_TO_ROLE = {
