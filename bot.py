@@ -37,7 +37,6 @@ MAIN_GUILD_ID = 1016796563227541574
 EM_CHANNEL_ID = 1414146583666364447
 SIGNUP_CHANNEL_ID = 1415624731293646891
 SIGNUP_MESSAGE_ID_ENV = int(os.getenv("SIGNUP_MESSAGE_ID") or 0)
-
 SELF_BOT_ID = 1413952299989995720
 
 ROLE_PREMKA300 = 1415630918529454081
@@ -528,9 +527,7 @@ def _spent_lines(s):
         v=s.get(k,0)
         if v and int(v)>0:
             parts.append(f"{E(k)} **{PL_NAME[k]}:** {fmt_int(v)}")
-    return "\n".join(parts) if parts else "—
-
-"
+    return "\n".join(parts) if parts else "—"
 
 def _embed(guild, s, show=False):
     gained=calc_points(charter=s["charter"],construction=s["construction"],sceat=s["sceat"],upgrade=s["upgrade"],samurai_medals=s["samurai_medals"],samurai_tokens=s["samurai_tokens"],khan_medals=s["khan_medals"],khan_tablets=s["khan_tablets"])
