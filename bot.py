@@ -484,7 +484,7 @@ def M(key:str)->str:
             if s: return s
     return MEDAL_UNI.get(key,"🔸")
 
-COST_PER_POINT={"charter":1,"construction":3,"sceat":4,"upgrade":9,"samurai_medals":50,"samurai_tokens":1380,"khan_medals":3400,"khan_tablets":1950}
+COST_PER_POINT={"charter":1,"construction":3,"sceat":5,"upgrade":8,"samurai_medals":63,"samurai_tokens":2050,"khan_medals":14200,"khan_tablets":5400}
 LEVEL_COSTS=[310,915,2030,3600,5280,6650,9300,13300,14600,25200]
 MELEE=[1,2,3,4,5,6,7,10,13,15]; RANGED=[1,2,3,4,5,6,7,10,13,15]; COURTY=[0,0,0,0,1,3,6,9,12,15]
 PL_NAME={"charter":"Żetony patronatu","construction":"Żetony budowy","sceat":"Groszaki","upgrade":"Żetony ulepszenia","samurai_medals":"Medale Samuraja","samurai_tokens":"Żetony Samuraja","khan_medals":"Medale Chana","khan_tablets":"Tabliczki Nomada"}
